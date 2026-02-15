@@ -9,7 +9,7 @@ from orbit_node.config import MANIFEST_DIR, PUBLIC_JSON_PATH
 logger = logging.getLogger(__name__)
 from orbit_node.storage import write_json
 from orbit_node.envelopes import encrypt_key_for_follower
-from orbit_node.ipfs_client import ipfs_add_bytes
+from orbit_node.ipfs_client import ipfs_add_bytes, publish_public_json_to_ipns
 
 MANIFEST_PATH = MANIFEST_DIR / "manifest.json"
 
@@ -104,6 +104,10 @@ def _update_public_json_manifest_pointer(manifest_cid: str) -> dict:
 
     public_obj["manifest_pointer"] = manifest_cid
     write_json(PUBLIC_JSON_PATH, public_obj)
+
+    # Republish to IPFS + IPNS so the decentralized pointer stays current
+    publish_public_json_to_ipns()
+
     return public_obj
 
 

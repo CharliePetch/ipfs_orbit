@@ -6,7 +6,7 @@ from nacl.secret import SecretBox
 from nacl.utils import random as nacl_random
 
 from orbit_node.config import PUBLIC_JSON_PATH, BASE_DIR
-from orbit_node.ipfs_client import ipfs_add_bytes
+from orbit_node.ipfs_client import ipfs_add_bytes, publish_public_json_to_ipns
 from orbit_node.followers import list_followers
 from orbit_node.following import list_following
 from orbit_node.envelopes import encrypt_key_for_follower
@@ -120,6 +120,9 @@ def rebuild_graphs_and_envelopes():
     public_json["follow_decoder_envelopes_cid"] = follow_decoder_envelopes_cid
 
     PUBLIC_JSON_PATH.write_text(json.dumps(public_json, indent=2))
+
+    # Republish to IPFS + IPNS so the decentralized pointer stays current
+    publish_public_json_to_ipns()
 
     return {
         "following_cid": following_cid,

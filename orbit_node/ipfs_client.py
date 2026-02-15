@@ -139,3 +139,53 @@ def ipfs_id() -> dict:
         return r.json()
 
     return _with_retry(_post)
+
+
+# ---------------------------------------------------------------------------
+# public.json → IPFS + IPNS (shared helper)
+# ---------------------------------------------------------------------------
+
+def publish_public_json_to_ipns() -> str | None:
+    """
+    Read public.json from disk, publish it to IPFS, then update the IPNS pointer.
+    Returns the new CID, or None if publishing fails.
+
+    Call this after ANY mutation to public.json (new post, graph rebuild, rewrap, etc.)
+    so that the IPNS record always points to the latest state.
+    """
+    import json
+    from orbit_node.config import PUBLIC_JSON_PATH
+
+    try:
+        if not PUBLIC_JSON_PATH.exists():
+            logger.warning("publish_public_json_to_ipns: public.json not found, skipping")
+            return None
+
+        obj = json.loads(PUBLIC_JSON_PATH.read_text())
+
+        # Ensure IPFS peer ID is current
+        try:
+            node_info = ipfs_id()
+            peer_id = node_info.get("ID")
+            if peer_id and obj.get("ipfs_peer_id") != peer_id:
+                obj["ipfs_peer_id"] = peer_id
+                PUBLIC_JSON_PATH.write_text(json.dumps(obj, indent=2))
+        except Exception as exc:
+            logger.debug("Could not fetch IPFS peer ID: %s", exc)
+
+        # Publish to IPFS
+        public_json_bytes = json.dumps(obj, indent=2).encode("utf-8")
+        cid = ipfs_add_bytes(public_json_bytes)
+        logger.info("public.json published to IPFS: %s", cid)
+
+        # Update IPNS pointer
+        result = ipfs_name_publish(cid, lifetime="8760h")
+        logger.info(
+            "IPNS pointer updated: %s -> /ipfs/%s",
+            result.get("Name", "?"), cid,
+        )
+        return cid
+
+    except Exception as exc:
+        logger.warning("IPNS publish failed (station still works via HTTP): %s", exc)
+        return None

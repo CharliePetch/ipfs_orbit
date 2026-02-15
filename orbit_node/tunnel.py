@@ -80,34 +80,8 @@ def _update_endpoint(endpoint_url: str) -> None:
     logger.info("Tunnel endpoint updated in public.json: %s", endpoint_url)
 
     # --- Publish to IPFS + IPNS ---
-    try:
-        from orbit_node.ipfs_client import ipfs_add_bytes, ipfs_name_publish, ipfs_id
-
-        # Store the peer ID in public.json so /profile can expose it
-        try:
-            node_info = ipfs_id()
-            peer_id = node_info.get("ID")
-            if peer_id and obj.get("ipfs_peer_id") != peer_id:
-                obj["ipfs_peer_id"] = peer_id
-                PUBLIC_JSON_PATH.write_text(json.dumps(obj, indent=2))
-                logger.info("IPFS peer ID stored: %s", peer_id)
-        except Exception as exc:
-            logger.warning("Could not fetch IPFS peer ID: %s", exc)
-
-        # Add updated public.json to IPFS
-        public_json_bytes = json.dumps(obj, indent=2).encode("utf-8")
-        cid = ipfs_add_bytes(public_json_bytes)
-        logger.info("public.json published to IPFS: %s", cid)
-
-        # Publish CID to IPNS (under the node's peer ID)
-        result = ipfs_name_publish(cid, lifetime="8760h")
-        logger.info(
-            "IPNS pointer updated: %s -> /ipfs/%s",
-            result.get("Name", "?"), cid,
-        )
-
-    except Exception as exc:
-        logger.warning("IPFS/IPNS publish failed (station still works via tunnel): %s", exc)
+    from orbit_node.ipfs_client import publish_public_json_to_ipns
+    publish_public_json_to_ipns()
 
 
 def _poll_and_update():
