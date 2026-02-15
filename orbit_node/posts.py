@@ -3,13 +3,15 @@ import json
 import logging
 from typing import Literal, Optional
 
+from nacl.public import PrivateKey
 from nacl.secret import SecretBox
 from nacl.utils import random as nacl_random
 
-from orbit_node.ipfs_client import ipfs_add_bytes
+from orbit_node.ipfs_client import ipfs_add_bytes, ipfs_get_bytes
 from orbit_node.followers import list_followers
-from orbit_node.manifest import add_post_to_manifest
+from orbit_node.manifest import add_post_to_manifest, load_manifest, remove_post_from_manifest
 from orbit_node.identity import get_identity
+from orbit_node.envelopes import open_envelope, encrypt_key_for_follower
 
 logger = logging.getLogger(__name__)
 
@@ -238,4 +240,105 @@ def handle_new_post(
         "followers_raw": len(followers_raw),
         "followers_used": len(followers_for_envelopes),
         "manifest_posts": len(manifest.get("posts", [])),
+    }
+
+
+def handle_reshare_post(
+    post_cid: str,
+    *,
+    audience_mode: AudienceMode = "specific",
+    audience_uids: Optional[list[str]] = None,
+    client: Optional[str] = None,
+) -> dict:
+    """
+    Update a post's audience by removing and re-creating its manifest entry
+    with new envelopes.
+
+    The station recovers the symmetric key from its own sealed-box envelope,
+    then re-encrypts for the new audience set.
+    """
+    station_sk, station_pk_hex, pub_json = get_identity()
+    self_uid = pub_json.get("uid")
+    if not self_uid:
+        raise ValueError("Identity missing uid")
+
+    aud_mode = _normalize_audience_mode(audience_mode)
+
+    # 1) Find the existing post entry in the manifest
+    manifest = load_manifest(client=client)
+    client_key = (client or "default").strip() or "default"
+
+    # Search for the post
+    old_entry = None
+    for ck, bucket in manifest.get("clients", {}).items():
+        for entry in bucket.get("posts", []):
+            if entry.get("post_cid") == post_cid:
+                old_entry = entry
+                client_key = ck
+                break
+        if old_entry:
+            break
+
+    if not old_entry:
+        return {"status": "not_found", "post_cid": post_cid}
+
+    old_envelopes_cid = old_entry.get("envelopes_cid")
+    old_metadata_enc = old_entry.get("metadata")
+
+    # 2) Recover the symmetric key from the station's own envelope
+    if not old_envelopes_cid:
+        return {"status": "error", "detail": "Post has no envelopes_cid"}
+
+    raw = ipfs_get_bytes(old_envelopes_cid)
+    env_obj = json.loads(raw.decode("utf-8"))
+    envelopes_map = env_obj.get("envelopes", {})
+
+    self_envelope_hex = envelopes_map.get(self_uid)
+    if not self_envelope_hex:
+        return {"status": "error", "detail": "No self envelope found; cannot recover key"}
+
+    # station_sk is already a PrivateKey from get_identity()
+    sym_key = open_envelope(station_sk, self_envelope_hex)
+    if not sym_key or len(sym_key) != SecretBox.KEY_SIZE:
+        return {"status": "error", "detail": "Failed to recover symmetric key"}
+
+    # 3) Build new follower list for the new audience
+    followers_raw = list_followers()
+    followers_user_level = _dedupe_followers_for_user_level_envelopes(followers_raw)
+    followers_user_level = [f for f in followers_user_level if f.get("uid") != self_uid]
+
+    recipients = _filter_followers_for_audience(
+        followers_user_level=followers_user_level,
+        self_uid=self_uid,
+        audience_mode=aud_mode,
+        audience_uids=audience_uids,
+    )
+
+    followers_for_envelopes = _force_self_row(
+        followers=recipients,
+        self_uid=self_uid,
+        station_pk_hex=station_pk_hex,
+        pub_json=pub_json,
+    )
+
+    # 4) Remove old entry from manifest
+    remove_post_from_manifest(post_cid, client=client_key)
+
+    # 5) Re-add with new audience (same post_cid, same metadata, new envelopes)
+    manifest = add_post_to_manifest(
+        post_cid=post_cid,
+        followers=followers_for_envelopes,
+        sym_key=sym_key,
+        metadata_enc=old_metadata_enc,
+        audience_mode=aud_mode,
+        audience_uids=audience_uids,
+        client=client_key,
+    )
+
+    return {
+        "status": "shared",
+        "post_cid": post_cid,
+        "audience_mode": aud_mode,
+        "audience_uids": (audience_uids or []) if aud_mode == "specific" else None,
+        "envelopes_count": len(followers_for_envelopes),
     }

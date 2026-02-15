@@ -10,13 +10,14 @@ from orbit_node.config import ensure_directories, MAX_UPLOAD_SIZE, CORS_ORIGINS
 from orbit_node.inbox import process_inbox_message
 from orbit_node.rewrap import handle_rewrap_request
 
-from orbit_node.posts import handle_new_post
+from orbit_node.posts import handle_new_post, handle_reshare_post
+from orbit_node.manifest import remove_post_from_manifest
 from orbit_node.profile import get_public_profile
 from orbit_node.following import follow_user, unfollow_user
 from orbit_node.graph import rebuild_graphs_and_envelopes
 from orbit_node.database import get_db
 from orbit_node.identity import get_identity
-from orbit_node.followers import add_follower_device
+from orbit_node.followers import add_follower_device, list_followers
 from orbit_node.pairing import create_pairing_session, confirm_pairing_session
 from orbit_node.auth import require_delegate
 from orbit_node.tunnel import start_tunnel_monitor
@@ -63,7 +64,7 @@ app.add_middleware(
 # --------------------------------------------
 @app.middleware("http")
 async def capture_raw_body_sha256(request: Request, call_next):
-    guarded_paths = {"/post", "/rewrap", "/follow", "/unfollow", "/inbox"}
+    guarded_paths = {"/post", "/post/delete", "/post/share", "/rewrap", "/follow", "/unfollow", "/inbox"}
     if request.url.path in guarded_paths:
         cl = request.headers.get("content-length")
         if cl is not None and cl.isdigit() and int(cl) > MAX_UPLOAD_SIZE:
@@ -178,6 +179,8 @@ def create_post(
     file: UploadFile = File(...),
     metadata: str = Form(None),
     client: str = Form(None),
+    audience_mode: str = Form("all"),
+    audience_uids: str = Form(None),
 ):
     file_bytes = file.file.read()
 
@@ -188,7 +191,67 @@ def create_post(
         except Exception as e:
             logger.warning(f"Invalid metadata JSON: {e}")
 
-    return handle_new_post(file_bytes, metadata=metadata_obj, client=client)
+    # Parse audience_uids from JSON string if provided
+    parsed_audience_uids = None
+    if audience_uids:
+        try:
+            parsed_audience_uids = json.loads(audience_uids)
+        except Exception:
+            parsed_audience_uids = [u.strip() for u in audience_uids.split(",") if u.strip()]
+
+    return handle_new_post(
+        file_bytes,
+        metadata=metadata_obj,
+        client=client,
+        audience_mode=audience_mode,
+        audience_uids=parsed_audience_uids,
+    )
+
+
+# ---------------------------------------------------------
+# DELETE POST
+# ---------------------------------------------------------
+class DeletePostRequest(BaseModel):
+    post_cid: str
+    client: str | None = None
+
+
+@app.post("/post/delete")
+def delete_post(req: DeletePostRequest, delegate=Depends(require_delegate)):
+    result = remove_post_from_manifest(req.post_cid, client=req.client)
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail=f"Post {req.post_cid} not found in manifest")
+    return result
+
+
+# ---------------------------------------------------------
+# SHARE / RESHARE POST
+# ---------------------------------------------------------
+class SharePostRequest(BaseModel):
+    post_cid: str
+    audience_mode: str = "specific"
+    audience_uids: list[str] | None = None
+    client: str | None = None
+
+
+@app.post("/post/share")
+def share_post(req: SharePostRequest, delegate=Depends(require_delegate)):
+    try:
+        result = handle_reshare_post(
+            req.post_cid,
+            audience_mode=req.audience_mode,
+            audience_uids=req.audience_uids,
+            client=req.client,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if result.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=f"Post {req.post_cid} not found")
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get("detail", "Unknown error"))
+
+    return result
 
 
 # ---------------------------------------------------------
@@ -197,6 +260,42 @@ def create_post(
 @app.get("/profile")
 def profile():
     return get_public_profile()
+
+
+# ---------------------------------------------------------
+# LIST FOLLOWERS (for share picker)
+# ---------------------------------------------------------
+@app.get("/followers")
+def api_list_followers(delegate=Depends(require_delegate)):
+    """
+    Returns user-level followers (deduplicated from devices),
+    excluding the station's own UID.
+    """
+    _, _, pub_json = get_identity()
+    self_uid = pub_json["uid"]
+
+    raw = list_followers()
+
+    # Deduplicate to user level, keep only Allowed, exclude self
+    seen: dict[str, dict] = {}
+    for f in raw:
+        uid = f.get("uid")
+        if not uid or uid == self_uid:
+            continue
+        if f.get("allowed") != "Allowed":
+            continue
+        if uid not in seen:
+            seen[uid] = {
+                "uid": uid,
+                "alias": f.get("alias"),
+                "endpoint": f.get("endpoint"),
+                "ipns_id": f.get("ipns_id"),
+            }
+
+    return {
+        "status": "ok",
+        "followers": sorted(seen.values(), key=lambda f: f["uid"]),
+    }
 
 
 class FollowRequest(BaseModel):

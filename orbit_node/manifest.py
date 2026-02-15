@@ -243,3 +243,63 @@ def add_post_to_manifest(
     _update_public_json_manifest_pointer(manifest_cid)
 
     return manifest
+
+
+def remove_post_from_manifest(
+    post_cid: str,
+    *,
+    client: Optional[str] = None,
+) -> dict:
+    """
+    Remove a post from the manifest by its post_cid.
+
+    - Searches the given client bucket (or all buckets if client is None)
+    - Removes the matching post entry
+    - Re-publishes manifest to IPFS + updates public.json pointer + IPNS
+
+    Returns dict with status info.
+    """
+    manifest = load_manifest(client=client)
+
+    found = False
+    searched_client = None
+
+    if client:
+        client_key = client.strip() or "default"
+        bucket = manifest.get("clients", {}).get(client_key, {})
+        posts = bucket.get("posts", [])
+        original_count = len(posts)
+        bucket["posts"] = [p for p in posts if p.get("post_cid") != post_cid]
+        if len(bucket["posts"]) < original_count:
+            found = True
+            searched_client = client_key
+    else:
+        # Search all client buckets
+        for ck, bucket in manifest.get("clients", {}).items():
+            posts = bucket.get("posts", [])
+            original_count = len(posts)
+            bucket["posts"] = [p for p in posts if p.get("post_cid") != post_cid]
+            if len(bucket["posts"]) < original_count:
+                found = True
+                searched_client = ck
+                break
+
+    if not found:
+        return {"status": "not_found", "post_cid": post_cid}
+
+    save_manifest(manifest, client=searched_client)
+
+    manifest_cid = _publish_manifest_to_ipfs(manifest)
+    _update_public_json_manifest_pointer(manifest_cid)
+
+    remaining = sum(
+        len(b.get("posts", []))
+        for b in manifest.get("clients", {}).values()
+    )
+
+    return {
+        "status": "deleted",
+        "post_cid": post_cid,
+        "client": searched_client,
+        "manifest_posts": remaining,
+    }
