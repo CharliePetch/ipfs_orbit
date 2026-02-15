@@ -257,6 +257,7 @@ def api_unfollow(req: UnfollowRequest, auth_ctx=Depends(require_delegate)):
 def delegate_start(req: DelegateStart):
     sess = create_pairing_session(req.device_uid, req.public_key)
     logger.info(f"Pairing session created: pairing_id={sess.pairing_id}")
+    logger.info(f">>> PAIRING PIN: {sess.pin} <<< (expires in 5 minutes)")
     return {"status": "ok", "pairing_id": sess.pairing_id, "expires_in_seconds": 5 * 60}
 
 
