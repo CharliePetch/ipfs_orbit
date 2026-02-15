@@ -1,6 +1,6 @@
 # Orbit Protocol Specification
 
-**Version:** 1.0-draft
+**Version:** 1.1-draft
 **Date:** 2026-02-14
 **Status:** Draft
 
@@ -11,6 +11,8 @@
 Orbit is a self-hosted, end-to-end encrypted content sharing protocol built on IPFS. A user runs a **station** (e.g., on a Raspberry Pi at home), publishes encrypted content to IPFS, and provisions access to friends, family, or followers via cryptographic **envelopes** containing per-post decryption keys. The station owner's content is replicated and made available through IPFS's content-addressed storage, removing dependence on centralized platforms.
 
 The protocol is designed to be **extensible**: different application-layer **clients** (photo sharing, file storage, document collaboration, etc.) share the same identity, encryption, and access-control infrastructure while defining their own metadata schemas within a unified manifest.
+
+Stations are **permanently discoverable** via IPNS. Each station's IPFS peer ID acts as a stable address: followers resolve it through the DHT to find the station's current `public.json`, regardless of whether the station's IP address or tunnel URL has changed.
 
 ---
 
@@ -36,6 +38,8 @@ All integers are unsigned unless otherwise noted. All strings are UTF-8. Hexadec
 | **CID** | Content Identifier. An IPFS content-addressed hash (typically CIDv0/Base58). |
 | **Post** | A single encrypted content blob stored on IPFS, along with its associated envelopes and metadata. |
 | **Audience** | The set of UIDs permitted to decrypt a given post. Controlled by `audience_mode`. |
+| **IPNS** | InterPlanetary Name System. A mutable pointer system built on IPFS, keyed by the node's peer ID. Used to publish a stable address that resolves to the station's current `public.json` CID. |
+| **Peer ID** | The IPFS node's cryptographic identity, derived from its keypair. Acts as the permanent, location-independent address for a station. |
 
 ---
 
@@ -49,9 +53,9 @@ All integers are unsigned unless otherwise noted. All strings are UTF-8. Hexadec
                         /              \
     [Station]  <-- IPFS Daemon -->  [IPFS Peers]
     (FastAPI)      (port 5001)
-        |
-        |  HTTPS / LAN
-        |
+        |                \
+        |  HTTPS / LAN    \--- IPNS DHT
+        |                      (permanent discovery)
     [Delegate Device]
     (iOS / Android / Web)
 ```
@@ -61,6 +65,7 @@ A station consists of:
 - A **local IPFS daemon** (Kubo, port 5001)
 - A **SQLite database** for follower/device state
 - A **local filesystem** for key material and manifests
+- An optional **Cloudflare Quick Tunnel** for zero-configuration public access
 
 Delegate devices communicate with the station over HTTP (ideally HTTPS in production) and access IPFS content either through the station's IPFS gateway or their own IPFS node.
 
@@ -89,6 +94,8 @@ The **station** is the root of trust:
  |  Content Encryption Layer                  |  Per-post symmetric encryption + envelopes
  +-------------------------------------------+
  |  Identity Layer                            |  Keypairs, UIDs, public identity
+ +-------------------------------------------+
+ |  Discovery Layer (IPNS)                    |  Permanent station addresses
  +-------------------------------------------+
  |  Cryptographic Primitives                  |  NaCl, Argon2i, BLAKE2b, HMAC
  +-------------------------------------------+
@@ -241,7 +248,8 @@ Every station MUST publish a public identity document:
   "manifest_pointer": "<ipfs-cid> | null",
   "followers_cid": "<ipfs-cid> | null",
   "following_cid": "<ipfs-cid> | null",
-  "follow_decoder_envelopes_cid": "<ipfs-cid> | null"
+  "follow_decoder_envelopes_cid": "<ipfs-cid> | null",
+  "ipfs_peer_id": "<peer-id> | null"
 }
 ```
 
@@ -255,6 +263,7 @@ Every station MUST publish a public identity document:
 | `followers_cid` | MAY | IPFS CID of the encrypted followers graph |
 | `following_cid` | MAY | IPFS CID of the encrypted following graph |
 | `follow_decoder_envelopes_cid` | MAY | IPFS CID of the graph decoder envelopes |
+| `ipfs_peer_id` | SHOULD | The station's IPFS peer ID, used for IPNS-based discovery (see Section 18) |
 
 ### 5.4 Bootstrap Flow
 
@@ -423,7 +432,7 @@ public.json["manifest_pointer"] = manifest_cid
 6. Decrypt blob with `SecretBox(sym_key)` -> plaintext.
 
 **For an external follower:**
-1. Fetch the station's `public.json` (via their endpoint or IPFS).
+1. Fetch the station's `public.json` (via their endpoint or IPNS — see Section 18).
 2. Fetch manifest from IPFS using `manifest_pointer`.
 3. For each post, fetch envelopes JSON using `envelopes_cid`.
 4. Look up envelope for own uid.
@@ -549,6 +558,7 @@ Followers are tracked at the **device level** in the station's local database.
 | `alias` | TEXT, NULL | Human-readable name |
 | `allowed` | TEXT, NOT NULL, DEFAULT "Allowed" | Access status: `"Allowed"` or `"Denied"` |
 | `endpoint` | TEXT, NULL | Follower's station URL |
+| `ipns_id` | TEXT, NULL | Follower's IPFS peer ID for IPNS-based discovery |
 
 **Primary key:** `(uid, public_key)`
 
@@ -562,8 +572,11 @@ Users the station owner follows.
 | `public_key` | TEXT, NOT NULL | Target user's public key |
 | `endpoint` | TEXT, NOT NULL | Target user's station URL |
 | `alias` | TEXT, NULL | Human-readable name |
+| `ipns_id` | TEXT, NULL | Target user's IPFS peer ID for IPNS-based discovery |
 
 **Primary key:** `(uid, public_key)`
+
+The `ipns_id` field enables endpoint-independent discovery. Even when a station's HTTP endpoint changes (e.g., after a Cloudflare tunnel restart), followers can resolve the station's current `public.json` via IPNS using the peer ID (see Section 18).
 
 ### 9.3 Graph Encryption
 
@@ -581,7 +594,8 @@ The follower and following lists are encrypted and published to IPFS for distrib
       "device_uid": "<uuid>",
       "alias": "<string | null>",
       "allowed": "Allowed",
-      "endpoint": "<url | null>"
+      "endpoint": "<url | null>",
+      "ipns_id": "<peer-id | null>"
     }
   ]
 }
@@ -596,7 +610,8 @@ The follower and following lists are encrypted and published to IPFS for distrib
     {
       "uid": "<uuid>",
       "public_key": "<64-hex>",
-      "endpoint": "<url>"
+      "endpoint": "<url>",
+      "ipns_id": "<peer-id | null>"
     }
   ]
 }
@@ -967,7 +982,13 @@ Returns the station's public identity document.
 
 **Authentication:** None
 
-**Response:** `public.json` contents (see Section 5.3)
+**Response:** `public.json` contents (see Section 5.3), including `ipfs_peer_id` for IPNS discovery.
+
+#### `GET /health`
+
+Returns station health status.
+
+**Authentication:** None
 
 ### 14.2 Unauthenticated Endpoints
 
@@ -1163,6 +1184,28 @@ Follower                                            IPFS
   |     f. If metadata present: decrypt metadata      |
 ```
 
+### 15.6 IPNS Discovery Flow
+
+```
+Follower                    IPFS DHT                    Station
+  |                           |                           |
+  |  1. Resolve IPNS name     |                           |
+  |     /ipns/<peer-id> ----->|                           |
+  |                           |  (DHT lookup)             |
+  |  <-- /ipfs/<cid> ---------|                           |
+  |                           |                           |
+  |  2. Fetch public.json     |                           |
+  |     via CID ------------->|                           |
+  |  <-- public.json ---------|                           |
+  |                           |                           |
+  |  3. Read endpoint URL     |                           |
+  |     from public.json      |                           |
+  |  4. Connect to station ------------------------------>|
+  |  <-- direct API access --------------------------------|
+```
+
+This flow allows followers to find a station even when its HTTP endpoint has changed, as long as the IPNS record is current.
+
 ---
 
 ## 16. Client Extension Model
@@ -1305,11 +1348,13 @@ Follow requests targeting the station's own uid MUST be rejected. This prevents 
 
 ---
 
-## 18. IPFS Integration
+## 18. IPFS & IPNS Integration
 
 ### 18.1 IPFS Daemon
 
-The station MUST run a local IPFS daemon (e.g., Kubo) with the HTTP API enabled on port 5001 (default).
+The station MUST run a local IPFS daemon (e.g., Kubo) with the HTTP API enabled on port 5001 (default). For resource-constrained devices (Raspberry Pi), the `lowpower` profile is RECOMMENDED.
+
+The IPFS API and Gateway SHOULD be bound to localhost only (`/ip4/127.0.0.1/tcp/5001` and `/ip4/127.0.0.1/tcp/8080`) to prevent unauthorized access.
 
 ### 18.2 API Operations
 
@@ -1330,6 +1375,13 @@ POST http://127.0.0.1:5001/api/v0/cat?arg=<CID>
 
 Response body contains the raw bytes.
 
+**Get node identity:**
+```
+POST http://127.0.0.1:5001/api/v0/id
+```
+
+Response includes `"ID"` (the peer ID), `"PublicKey"`, and `"Addresses"`.
+
 ### 18.3 Pinning
 
 The station SHOULD pin all CIDs it publishes to ensure content remains available. This includes:
@@ -1337,6 +1389,7 @@ The station SHOULD pin all CIDs it publishes to ensure content remains available
 - Envelopes documents (`envelopes_cid`)
 - Manifest versions (`manifest_pointer`)
 - Encrypted social graphs (`followers_cid`, `following_cid`, `follow_decoder_envelopes_cid`)
+- The station's `public.json` (published to IPFS for IPNS resolution)
 
 Old manifest versions and superseded envelope documents MAY be unpinned to reclaim storage.
 
@@ -1347,29 +1400,265 @@ IPFS uses content-based addressing: the CID is a cryptographic hash of the conte
 - **Deduplication:** Identical content produces the same CID.
 - **Immutability:** Published content cannot be altered without changing the CID.
 
+### 18.5 IPNS — Permanent Station Discovery
+
+IPNS (InterPlanetary Name System) provides a mutable pointer that maps a station's IPFS **peer ID** to the CID of its current `public.json`. This solves the problem of changing CIDs: every time `public.json` is updated (new manifest, new endpoint URL, etc.), the content hash changes, but the IPNS name (the peer ID) stays the same.
+
+#### 18.5.1 How IPNS Works
+
+Each IPFS node has a cryptographic identity (peer ID) derived from its keypair. IPNS allows the node to sign a record saying "my peer ID currently points to CID X" and publish that record to the DHT. Anyone who knows the peer ID can resolve the current CID.
+
+```
+Peer ID (stable)  --IPNS-->  /ipfs/<CID>  --IPFS-->  public.json
+```
+
+#### 18.5.2 Publishing
+
+The station publishes its `public.json` to IPNS whenever the document changes. The publishing flow:
+
+1. Serialize `public.json` to bytes.
+2. Upload to IPFS: `cid = ipfs_add_bytes(public_json_bytes)`.
+3. Publish to IPNS: `ipfs_name_publish(cid, lifetime="8760h")`.
+
+The `lifetime` parameter controls how long the IPNS record is valid before it needs to be refreshed. Stations SHOULD use a long lifetime (e.g., `8760h` = 1 year) and re-publish periodically to keep the record fresh.
+
+**IPNS Publish API:**
+```
+POST http://127.0.0.1:5001/api/v0/name/publish?arg=<CID>&lifetime=8760h
+```
+
+Response:
+```json
+{
+  "Name": "<peer-id>",
+  "Value": "/ipfs/<cid>"
+}
+```
+
+#### 18.5.3 Resolution
+
+Followers (or any party) can resolve a station's current `public.json` using only the peer ID:
+
+**IPNS Resolve API:**
+```
+POST http://127.0.0.1:5001/api/v0/name/resolve?arg=<peer-id>
+```
+
+Response:
+```json
+{
+  "Path": "/ipfs/<cid>"
+}
+```
+
+Public gateways also support IPNS resolution:
+```
+https://ipfs.io/ipns/<peer-id>
+```
+
+#### 18.5.4 Peer ID as a Stable User Address
+
+The IPFS peer ID serves as a **permanent, location-independent address** for a station. Unlike HTTP endpoints (which change with IP addresses, tunnels, or DNS), the peer ID is derived from the IPFS node's keypair and remains constant for the lifetime of the node.
+
+This means:
+- A follower only needs to know a station's peer ID to find it.
+- The station can change its IP address, domain name, or Cloudflare tunnel URL without breaking discoverability.
+- The peer ID is stored in `public.json["ipfs_peer_id"]` and in the social graph's `ipns_id` field for each follower/following entry.
+- Followers can always fall back to IPNS resolution if the station's HTTP endpoint is unreachable.
+
+#### 18.5.5 Discovery Priority
+
+Clients SHOULD attempt to reach a station in this order:
+
+1. **Direct endpoint:** Use the `endpoint` URL from the station's `public.json` or social graph entry (fastest).
+2. **IPNS resolution:** If the endpoint is unreachable, resolve `ipns_id` via IPNS to get the current `public.json`, which contains the updated endpoint.
+3. **IPFS gateway:** As a last resort, fetch `public.json` via a public IPFS gateway: `https://ipfs.io/ipns/<peer-id>`.
+
+#### 18.5.6 IPNS Publishing Triggers
+
+The station SHOULD publish to IPNS whenever `public.json` changes materially:
+
+- **Endpoint change:** When the Cloudflare tunnel URL changes (detected by the tunnel monitor).
+- **Manifest update:** When new posts are published (the `manifest_pointer` CID changes).
+- **Social graph rebuild:** When followers/following lists change.
+- **Identity update:** When the alias or other identity fields change.
+
+The tunnel monitor daemon automatically handles endpoint changes by polling the tunnel URL and re-publishing to IPNS when it detects a change.
+
+### 18.6 Retry and Timeout Policy
+
+IPFS operations use exponential-backoff retry on transient errors (connection errors, timeouts). Non-transient HTTP errors (4xx) are raised immediately.
+
+| Operation | Timeout | Notes |
+|-----------|---------|-------|
+| `add` (upload) | Configurable (default 30s) | Standard timeout |
+| `cat` (download) | Configurable (default 30s) | Standard timeout |
+| `name/publish` | 60s | IPNS DHT publishing is slow |
+| `name/resolve` | 30s | DHT resolution can be slow |
+| `id` | Configurable (default 30s) | Local operation, fast |
+
+Maximum retries default to 3 with exponential backoff (1s, 2s, 4s).
+
 ---
 
-## 19. Backward Compatibility
+## 19. Station Setup & Installation
 
-### 19.1 Manifest Format
+### 19.1 Overview
+
+The `install.sh` script automates the complete setup of an Orbit station on a Raspberry Pi or similar Linux device. It installs all dependencies, configures services, bootstraps identity, and starts the station — producing a fully operational node in a single command.
+
+### 19.2 Prerequisites
+
+- A Linux system (Debian/Ubuntu-based, tested on Raspberry Pi OS)
+- `sudo` access
+- Internet connectivity for downloading dependencies
+
+### 19.3 Supported Architectures
+
+| Architecture | `uname -m` | IPFS Binary | Cloudflared |
+|-------------|------------|-------------|-------------|
+| ARM 64-bit | `aarch64`, `arm64` | `linux-arm64` | `linux-arm64` |
+| ARM 32-bit | `armv7l`, `armhf` | `linux-arm` | `linux-arm` |
+| x86 64-bit | `x86_64` | `linux-amd64` | `linux-amd64` |
+
+### 19.4 Installation Steps
+
+The installer executes the following steps in order:
+
+**Step 1: Python Detection**
+
+The installer searches for Python 3.11+ by probing `python3.12`, `python3.11`, and `python3` in order. If none is found, it installs Python via `apt-get`. The minimum version requirement is Python 3.11.
+
+**Step 2: System Dependencies**
+
+Installs required system packages:
+- `git`, `curl`, `openssl` — general utilities
+- `ufw` — firewall management
+- `python3-venv` — Python virtual environment support
+- `libsodium-dev` — NaCl cryptography library (required by PyNaCl)
+
+**Step 3: IPFS (Kubo) Installation**
+
+Downloads and installs the Kubo IPFS daemon (v0.28.0) from `dist.ipfs.tech`. The binary is placed at `/usr/local/bin/ipfs`. Skipped if IPFS is already installed.
+
+**Step 4: Cloudflared Installation (Optional)**
+
+Downloads the `cloudflared` binary for Cloudflare Quick Tunnel support. This enables zero-configuration public access without port forwarding. Gracefully skipped if the architecture is unsupported. See Section 19.7 for details.
+
+**Step 5: IPFS Initialization**
+
+Initializes the IPFS repository with the `lowpower` profile (suitable for Raspberry Pi). Configures the API and Gateway to bind to localhost only for security.
+
+**Step 6: Python Virtual Environment**
+
+Creates a Python virtual environment at `$ORBIT_DIR/.venv` and installs all dependencies from `requirements.txt`.
+
+**Step 7: Environment Configuration**
+
+Copies `.env.example` to `.env` on first run. If Cloudflared is available, automatically enables the tunnel in `.env`.
+
+**Step 8: Identity Bootstrap**
+
+Calls `orbit_node.identity.load_identity()` which:
+1. Generates a Curve25519 keypair.
+2. Generates a UUID v4.
+3. Writes `orbit_data/keys/private.bin` (64 bytes: sk + pk).
+4. Writes `orbit_data/public.json` with the identity fields.
+5. Registers the station as its own follower.
+
+**Step 9: Systemd Services**
+
+Creates and enables three systemd service units:
+
+| Service | Description | Dependencies |
+|---------|-------------|--------------|
+| `ipfs.service` | IPFS daemon with garbage collection | `network.target` |
+| `orbit.service` | Orbit FastAPI server | `ipfs.service` |
+| `cloudflared-tunnel.service` | Cloudflare Quick Tunnel (optional) | `orbit.service` |
+
+All services are configured with `Restart=on-failure` for automatic recovery.
+
+**Step 10: Firewall**
+
+Opens the Orbit port (default 8443/tcp) using UFW and force-enables the firewall.
+
+**Step 11: Service Startup**
+
+Starts IPFS first (with a 3-second delay for initialization), then the Orbit service, then optionally the Cloudflare tunnel.
+
+### 19.5 Post-Installation Output
+
+After installation, the script displays:
+- Service status for IPFS, Orbit, and (optionally) the tunnel
+- The station's **IPFS Peer ID** — the permanent address for IPNS discovery
+- The IPNS URL: `https://ipfs.io/ipns/<peer-id>`
+- LAN access URL
+- Tunnel URL location (appears in logs within ~30 seconds)
+- Useful management commands
+
+### 19.6 Directory Layout
+
+After installation, the station's data directory has this structure:
+
+```
+orbit_data/
+├── keys/
+│   └── private.bin           # Station keypair (64 bytes)
+├── public.json               # Public identity document
+├── manifests/
+│   └── manifest.json         # Local manifest cache
+├── orbit.db                  # SQLite database
+├── ssl/
+│   ├── cert.pem              # Self-signed TLS certificate
+│   └── key.pem               # TLS private key
+├── followers.json            # Plaintext followers (local inspection only)
+├── following.json            # Plaintext following (local inspection only)
+└── follow_envelopes.json     # Plaintext envelopes (local inspection only)
+```
+
+### 19.7 Cloudflare Quick Tunnel
+
+The station supports Cloudflare Quick Tunnel for zero-configuration public access. This provides:
+
+- **No port forwarding required.** The tunnel creates an outbound connection from the station to Cloudflare's edge, bypassing NAT and firewall restrictions.
+- **Automatic HTTPS.** Cloudflare provides a valid TLS certificate for the tunnel URL.
+- **Dynamic URLs.** Quick Tunnel URLs are randomly generated (e.g., `https://verb-noun-thing.trycloudflare.com`) and may change on restart.
+
+The tunnel monitor daemon (a background thread started on FastAPI startup) handles URL changes:
+
+1. Polls cloudflared's metrics endpoint (`http://localhost:40469/quicktunnel`) every 3 seconds during initial detection, then every 60 seconds.
+2. When the tunnel URL changes, updates `public.json["endpoint"]`.
+3. Re-publishes `public.json` to IPFS and updates the IPNS pointer.
+
+Because tunnel URLs are ephemeral, IPNS is critical for ensuring followers can always find the station (see Section 18.5).
+
+---
+
+## 20. Backward Compatibility
+
+### 20.1 Manifest Format
 
 Implementations MUST accept both the legacy flat format and the current multi-client format, normalizing to multi-client on read (see Section 8.6).
 
-### 19.2 Audience Mode
+### 20.2 Audience Mode
 
 The legacy value `"all_followers"` MUST be normalized to `"all"` on read.
 
-### 19.3 Envelope Encoding
+### 20.3 Envelope Encoding
 
 The current format uses hex encoding. Legacy implementations that produced base64-encoded envelopes SHOULD be supported for reading. New envelopes MUST be hex-encoded.
 
-### 19.4 Post CID Field
+### 20.4 Post CID Field
 
 Legacy manifests used `"cid"` instead of `"post_cid"`. Implementations MUST check both field names.
 
+### 20.5 Database Migrations
+
+The `ipns_id` column was added to the `followers` and `following` tables after the initial schema. Implementations MUST handle databases that lack this column by running `ALTER TABLE ... ADD COLUMN ipns_id TEXT NULL` on startup. SQLite's `OperationalError` for duplicate columns is silently ignored.
+
 ---
 
-## 20. Future Work
+## 21. Future Work
 
 - **Content deletion/expiry:** Mechanism for removing posts and notifying followers to discard cached keys.
 - **Manifest sharding:** For stations with large post counts, split the manifest into paginated segments.
@@ -1377,6 +1666,8 @@ Legacy manifests used `"cid"` instead of `"post_cid"`. Implementations MUST chec
 - **Key rotation:** Formal protocol for rotating the station's root keypair while maintaining access to historical content.
 - **Manifest encryption:** Option to encrypt the manifest itself, hiding post metadata from unauthorized IPFS observers.
 - **Streaming/chunked uploads:** Support for large files via IPFS UnixFS chunking with per-chunk encryption.
+- **IPNS over PubSub:** Faster IPNS propagation using IPFS PubSub for real-time updates instead of DHT polling.
+- **Multi-station federation:** Allow a user to run multiple stations that share the same identity and synchronize manifests.
 
 ---
 
@@ -1390,14 +1681,18 @@ CREATE TABLE followers (
     alias TEXT NULL,
     allowed TEXT NOT NULL DEFAULT 'Allowed',
     endpoint TEXT NULL,
+    ipns_id TEXT NULL,
     PRIMARY KEY (uid, public_key)
 );
+
+CREATE INDEX idx_followers_uid ON followers(uid);
 
 CREATE TABLE following (
     uid TEXT NOT NULL,
     public_key TEXT NOT NULL,
     endpoint TEXT NOT NULL,
     alias TEXT NULL,
+    ipns_id TEXT NULL,
     PRIMARY KEY (uid, public_key)
 );
 
@@ -1408,6 +1703,8 @@ CREATE TABLE auth_nonces (
     ts INTEGER NOT NULL,
     PRIMARY KEY (uid, device_uid, nonce)
 );
+
+CREATE INDEX idx_auth_nonces_ts ON auth_nonces(ts);
 
 CREATE TABLE pairing_sessions (
     pairing_id TEXT PRIMARY KEY,
@@ -1428,15 +1725,27 @@ CREATE TABLE pairing_sessions (
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `IPFS_API` | `http://127.0.0.1:5001` | IPFS daemon HTTP API URL |
-| `BASE_DIR` | `./orbit_data` | Root directory for station data |
+| `ORBIT_PORT` | `8443` | HTTPS port for the Orbit station API |
+| `ORBIT_HOST` | `0.0.0.0` | Bind address for the station server |
+| `ORBIT_PASSWORD` | _(empty)_ | Optional password to encrypt the private key at rest (Argon2i) |
+| `IPFS_API_URL` | `http://127.0.0.1:5001` | IPFS daemon HTTP API URL |
+| `IPFS_TIMEOUT` | `30` | Default timeout (seconds) for IPFS operations |
+| `IPFS_MAX_RETRIES` | `3` | Maximum retry attempts for transient IPFS errors |
+| `ORBIT_BASE_DIR` | `./orbit_data` | Root directory for station data |
+| `SSL_CERTFILE` | `./orbit_data/ssl/cert.pem` | Path to TLS certificate |
+| `SSL_KEYFILE` | `./orbit_data/ssl/key.pem` | Path to TLS private key |
+| `MAX_UPLOAD_SIZE` | `104857600` (100 MB) | Maximum upload size for post content |
+| `CORS_ORIGINS` | `*` | Allowed CORS origins |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `CLOUDFLARE_TUNNEL_ENABLED` | `false` | Enable Cloudflare Quick Tunnel integration |
+| `CLOUDFLARE_METRICS_PORT` | `40469` | Port for cloudflared's metrics/quicktunnel endpoint |
 | `ORBIT_MAX_DEVICES_PER_FOLLOWER` | `20` | Maximum devices per follower uid |
 | `ORBIT_AUTO_REWRAP_ON_FOLLOW_CHANGE` | `1` | Enable auto-rewrap when followers change (`0` to disable) |
 | `MAX_SKEW_SECONDS` | `60` | Maximum clock skew for authenticated requests |
 | `NONCE_TTL_SECONDS` | `86400` | How long to retain nonces (24 hours) |
 | `PIN_LEN` | `6` | Length of pairing PIN |
-| `TTL_SECONDS` (pairing)| `300` | Pairing session timeout (5 minutes) |
-| `MAX_ATTEMPTS` (pairing)| `5` | Maximum PIN attempts per session |
+| `TTL_SECONDS` (pairing) | `300` | Pairing session timeout (5 minutes) |
+| `MAX_ATTEMPTS` (pairing) | `5` | Maximum PIN attempts per session |
 
 ---
 
@@ -1445,6 +1754,8 @@ CREATE TABLE pairing_sessions (
 - **NaCl / libsodium:** https://doc.libsodium.org/
 - **PyNaCl:** https://pynacl.readthedocs.io/
 - **IPFS:** https://docs.ipfs.tech/
+- **IPNS:** https://docs.ipfs.tech/concepts/ipns/
+- **Kubo:** https://github.com/ipfs/kubo
 - **Curve25519:** https://cr.yp.to/ecdh.html
 - **XSalsa20-Poly1305:** https://doc.libsodium.org/secret-key_cryptography/aead
 - **SealedBox:** https://doc.libsodium.org/public-key_cryptography/sealed_boxes
@@ -1454,3 +1765,4 @@ CREATE TABLE pairing_sessions (
 - **scrypt:** RFC 7914
 - **UUID v4:** RFC 9562
 - **RFC 2119 Keywords:** RFC 2119
+- **Cloudflare Quick Tunnel:** https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/
