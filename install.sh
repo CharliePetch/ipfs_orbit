@@ -269,7 +269,9 @@ Type=simple
 User=${ORBIT_USER}
 ExecStart=/usr/local/bin/cloudflared tunnel --url https://localhost:${ORBIT_PORT} --no-tls-verify --metrics localhost:40469
 Restart=on-failure
-RestartSec=10
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
