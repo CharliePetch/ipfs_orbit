@@ -176,7 +176,8 @@ def rewrap_route(msg: RewrapMessage, delegate=Depends(require_delegate)):
 def create_post(
     delegate=Depends(require_delegate),
     file: UploadFile = File(...),
-    metadata: str = Form(None)
+    metadata: str = Form(None),
+    client: str = Form(None),
 ):
     file_bytes = file.file.read()
 
@@ -187,7 +188,7 @@ def create_post(
         except Exception as e:
             logger.warning(f"Invalid metadata JSON: {e}")
 
-    return handle_new_post(file_bytes, metadata=metadata_obj)
+    return handle_new_post(file_bytes, metadata=metadata_obj, client=client)
 
 
 # ---------------------------------------------------------

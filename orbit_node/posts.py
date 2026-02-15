@@ -145,6 +145,7 @@ def handle_new_post(
     *,
     audience_mode: AudienceMode = "all",
     audience_uids: Optional[list[str]] = None,
+    client: str | None = None,
 ):
     """
     Encrypt post bytes, upload to IPFS, generate envelopes, and append to manifest.
@@ -218,7 +219,7 @@ def handle_new_post(
         metadata_enc=metadata_enc,
         audience_mode=aud_mode,        # "self" | "specific" | "all"
         audience_uids=audience_uids,   # list[str] if specific
-        client="orbitstagram",         # sets top-level manifest["client"] once
+        client=client,                 # client app name (e.g., "orbitstagram", "drive")
     )
 
     # 7) Pull the envelopes CID from the new entry (just appended)
