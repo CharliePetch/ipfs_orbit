@@ -144,8 +144,49 @@ ok "Python dependencies installed"
 # 6. Environment config
 # -----------------------------------------------------------
 if [ ! -f "$ORBIT_DIR/.env" ]; then
-    cp "$ORBIT_DIR/.env.example" "$ORBIT_DIR/.env"
-    ok "Created .env from template (edit as needed)"
+    cat > "$ORBIT_DIR/.env" <<'ENVFILE'
+# Orbit Station Configuration
+
+# --- Identity ---
+# Password for encrypting the station private key (leave empty for no encryption)
+ORBIT_PASSWORD=
+
+# --- Server ---
+ORBIT_PORT=8443
+ORBIT_HOST=0.0.0.0
+
+# --- TLS ---
+# Auto-generated on first run if missing
+SSL_CERTFILE=./orbit_data/ssl/cert.pem
+SSL_KEYFILE=./orbit_data/ssl/key.pem
+
+# --- IPFS ---
+IPFS_API_URL=http://127.0.0.1:5001
+IPFS_TIMEOUT=30
+IPFS_MAX_RETRIES=3
+
+# --- Limits ---
+# Max upload size in bytes (default: 100 MB)
+MAX_UPLOAD_SIZE=104857600
+
+# --- CORS ---
+# Comma-separated origins (use * for dev)
+CORS_ORIGINS=*
+
+# --- Logging ---
+# DEBUG, INFO, WARNING, ERROR
+LOG_LEVEL=INFO
+
+# --- Cloudflare Tunnel ---
+# Enable Cloudflare Quick Tunnel for public access (no account needed)
+CLOUDFLARE_TUNNEL_ENABLED=false
+# Metrics port for cloudflared (used to detect tunnel URL)
+CLOUDFLARE_METRICS_PORT=40469
+
+# --- Data ---
+ORBIT_BASE_DIR=./orbit_data
+ENVFILE
+    ok "Created .env with defaults (edit as needed)"
 else
     ok ".env already exists"
 fi
