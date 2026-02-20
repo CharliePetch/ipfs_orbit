@@ -145,6 +145,95 @@ def health_check():
 
 
 # ---------------------------------------------------------
+# STORAGE
+# ---------------------------------------------------------
+@app.get("/storage")
+def storage_info():
+    """
+    Returns IPFS repo usage, device disk usage, per-client breakdowns,
+    and computed percentages.
+    """
+    import shutil
+    from orbit_node.ipfs_client import ipfs_repo_stat, ipfs_object_stat
+    from orbit_node.manifest import load_manifest
+    from orbit_node.config import BASE_DIR
+
+    result = {}
+
+    # IPFS repo stats
+    repo_size = 0
+    try:
+        repo = ipfs_repo_stat()
+        repo_size = repo.get("RepoSize", 0)
+        storage_max = repo.get("StorageMax", 0)
+        num_objects = repo.get("NumObjects", 0)
+        repo_pct = round((repo_size / storage_max) * 100, 2) if storage_max > 0 else 0
+
+        result["ipfs"] = {
+            "repo_size_bytes": repo_size,
+            "storage_max_bytes": storage_max,
+            "num_objects": num_objects,
+            "used_percent": repo_pct,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get IPFS repo stat: {e}")
+        result["ipfs"] = {"error": str(e)}
+
+    # Device disk stats (partition where orbit_data lives)
+    try:
+        disk = shutil.disk_usage(BASE_DIR)
+        disk_pct = round((disk.used / disk.total) * 100, 2) if disk.total > 0 else 0
+
+        result["device"] = {
+            "total_bytes": disk.total,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+            "used_percent": disk_pct,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get disk usage: {e}")
+        result["device"] = {"error": str(e)}
+
+    # Per-client storage breakdown from manifest
+    try:
+        manifest = load_manifest()
+        clients_usage = {}
+        total_content_bytes = 0
+
+        for client_key, bucket in manifest.get("clients", {}).items():
+            client_bytes = 0
+            post_count = 0
+
+            for post in bucket.get("posts", []):
+                post_count += 1
+                for cid_key in ("post_cid", "envelopes_cid"):
+                    cid = post.get(cid_key)
+                    if cid:
+                        try:
+                            stat = ipfs_object_stat(cid)
+                            client_bytes += stat.get("CumulativeSize", 0)
+                        except Exception:
+                            pass
+
+            total_content_bytes += client_bytes
+            pct_of_repo = round((client_bytes / repo_size) * 100, 2) if repo_size > 0 else 0
+
+            clients_usage[client_key] = {
+                "size_bytes": client_bytes,
+                "post_count": post_count,
+                "percent_of_repo": pct_of_repo,
+            }
+
+        result["clients"] = clients_usage
+        result["total_content_bytes"] = total_content_bytes
+    except Exception as e:
+        logger.error(f"Failed to compute per-client storage: {e}")
+        result["clients"] = {"error": str(e)}
+
+    return result
+
+
+# ---------------------------------------------------------
 # INBOX
 # ---------------------------------------------------------
 @app.post("/inbox")

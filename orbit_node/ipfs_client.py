@@ -67,6 +67,89 @@ def ipfs_add_file(path: str) -> str:
         return ipfs_add_bytes(f.read())
 
 
+def ipfs_unpin(cid: str) -> bool:
+    """
+    Unpin a CID from the local IPFS node so it can be garbage-collected.
+    Returns True if the unpin succeeded (or the CID was already unpinned).
+    """
+    def _post():
+        r = requests.post(
+            f"{IPFS_API}/api/v0/pin/rm",
+            params={"arg": cid},
+            timeout=IPFS_TIMEOUT,
+        )
+        if r.status_code == 500 and "not pinned" in r.text.lower():
+            logger.debug("IPFS unpin: %s was already unpinned", cid)
+            return True
+        r.raise_for_status()
+        logger.debug("IPFS unpin OK: %s", cid)
+        return True
+
+    return _with_retry(_post)
+
+
+def ipfs_repo_gc() -> list[str]:
+    """
+    Run IPFS garbage collection to reclaim disk space from unpinned objects.
+    Returns a list of CIDs that were removed.
+    """
+    def _post():
+        r = requests.post(
+            f"{IPFS_API}/api/v0/repo/gc",
+            timeout=120,
+        )
+        r.raise_for_status()
+        # The response is newline-delimited JSON objects
+        removed = []
+        for line in r.text.strip().splitlines():
+            try:
+                obj = __import__("json").loads(line)
+                key = obj.get("Key", {})
+                cid = key.get("/") if isinstance(key, dict) else None
+                if cid:
+                    removed.append(cid)
+            except Exception:
+                continue
+        logger.info("IPFS GC completed: %d objects removed", len(removed))
+        return removed
+
+    return _with_retry(_post)
+
+
+def ipfs_repo_stat() -> dict:
+    """
+    Get IPFS repo statistics (storage used, object count, etc.).
+    Returns {"RepoSize": int, "StorageMax": int, "NumObjects": int, ...}.
+    """
+    def _post():
+        r = requests.post(
+            f"{IPFS_API}/api/v0/repo/stat",
+            timeout=IPFS_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    return _with_retry(_post)
+
+
+def ipfs_object_stat(cid: str) -> dict:
+    """
+    Get stats for an individual IPFS object.
+    Returns {"Hash": str, "CumulativeSize": int, "DataSize": int, ...}.
+    CumulativeSize is the total size including linked objects.
+    """
+    def _post():
+        r = requests.post(
+            f"{IPFS_API}/api/v0/object/stat",
+            params={"arg": cid},
+            timeout=IPFS_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    return _with_retry(_post)
+
+
 def ipfs_get_bytes(cid: str) -> bytes:
     """
     Fetch raw binary data from IPFS.

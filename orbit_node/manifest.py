@@ -9,7 +9,7 @@ from orbit_node.config import MANIFEST_DIR, PUBLIC_JSON_PATH
 logger = logging.getLogger(__name__)
 from orbit_node.storage import write_json
 from orbit_node.envelopes import encrypt_key_for_follower
-from orbit_node.ipfs_client import ipfs_add_bytes, publish_public_json_to_ipns
+from orbit_node.ipfs_client import ipfs_add_bytes, ipfs_unpin, ipfs_repo_gc, publish_public_json_to_ipns
 
 MANIFEST_PATH = MANIFEST_DIR / "manifest.json"
 
@@ -263,23 +263,34 @@ def remove_post_from_manifest(
 
     found = False
     searched_client = None
+    removed_entry = None
 
     if client:
         client_key = client.strip() or "default"
         bucket = manifest.get("clients", {}).get(client_key, {})
         posts = bucket.get("posts", [])
-        original_count = len(posts)
-        bucket["posts"] = [p for p in posts if p.get("post_cid") != post_cid]
-        if len(bucket["posts"]) < original_count:
+        kept = []
+        for p in posts:
+            if p.get("post_cid") == post_cid and removed_entry is None:
+                removed_entry = p
+            else:
+                kept.append(p)
+        if removed_entry is not None:
+            bucket["posts"] = kept
             found = True
             searched_client = client_key
     else:
         # Search all client buckets
         for ck, bucket in manifest.get("clients", {}).items():
             posts = bucket.get("posts", [])
-            original_count = len(posts)
-            bucket["posts"] = [p for p in posts if p.get("post_cid") != post_cid]
-            if len(bucket["posts"]) < original_count:
+            kept = []
+            for p in posts:
+                if p.get("post_cid") == post_cid and removed_entry is None:
+                    removed_entry = p
+                else:
+                    kept.append(p)
+            if removed_entry is not None:
+                bucket["posts"] = kept
                 found = True
                 searched_client = ck
                 break
@@ -292,6 +303,26 @@ def remove_post_from_manifest(
     manifest_cid = _publish_manifest_to_ipfs(manifest)
     _update_public_json_manifest_pointer(manifest_cid)
 
+    # Unpin the deleted post's content and envelopes from IPFS
+    unpinned_cids = []
+    for cid_key in ("post_cid", "envelopes_cid"):
+        cid = removed_entry.get(cid_key)
+        if cid:
+            try:
+                ipfs_unpin(cid)
+                unpinned_cids.append(cid)
+            except Exception as exc:
+                logger.warning("Failed to unpin %s (%s): %s", cid_key, cid, exc)
+
+    # Run garbage collection to reclaim disk space
+    gc_count = 0
+    if unpinned_cids:
+        try:
+            removed = ipfs_repo_gc()
+            gc_count = len(removed)
+        except Exception as exc:
+            logger.warning("IPFS garbage collection failed: %s", exc)
+
     remaining = sum(
         len(b.get("posts", []))
         for b in manifest.get("clients", {}).values()
@@ -302,4 +333,6 @@ def remove_post_from_manifest(
         "post_cid": post_cid,
         "client": searched_client,
         "manifest_posts": remaining,
+        "unpinned": unpinned_cids,
+        "gc_objects_removed": gc_count,
     }
