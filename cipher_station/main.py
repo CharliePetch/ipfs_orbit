@@ -352,6 +352,123 @@ def get_content(cid: str, request: Request, delegate=Depends(require_owner)):
 
 
 # ---------------------------------------------------------
+# FETCH — arbitrary CIDs through the station's own IPFS node
+#
+# GET /content/{cid} deliberately refuses anything this station did not
+# publish. This route is its counterpart for everything else: a paired
+# delegate asks the STATION to fetch a CID over its own libp2p connections
+# (bitswap/DHT) and stream the bytes back — bypassing public HTTP gateways
+# entirely. Public gateways rate-limit (429), truncate large bodies, and
+# cold-fetch through their own thin peerings; the station's node is often
+# better-connected to the content (it may even be the provider).
+#
+# Threat model / blast-radius controls:
+#   1. require_owner        — same ML-DSA device auth as /content. This is
+#                             not an open proxy; only the owner's paired
+#                             devices can drive it.
+#   2. FETCH_ENABLED        — operators who don't want their station
+#                             fetching third-party content can turn the
+#                             whole route into a 404 with one env var.
+#   3. FETCH_MAX_BYTES      — object size is checked (object/stat) BEFORE
+#                             any blocks are pulled; oversized CIDs are
+#                             refused with 413 and never touch the store.
+#   4. FETCH_PIN=false      — fetched blocks land as CACHE, not pins; the
+#                             next `repo gc` reclaims them. Nothing a
+#                             delegate fetches can silently grow the
+#                             permanent footprint unless the operator
+#                             opts in to pinning.
+#   5. FETCH_TIMEOUT        — a dead/unroutable CID costs one bounded DHT
+#                             walk, not a worker pinned forever.
+# ---------------------------------------------------------
+@app.get("/fetch/{cid}")
+def fetch_content(cid: str, request: Request, delegate=Depends(require_owner)):
+    from cipher_station.config import (
+        FETCH_ENABLED,
+        FETCH_MAX_BYTES,
+        FETCH_PIN,
+        FETCH_TIMEOUT,
+    )
+    from cipher_station.ipfs_client import (
+        CONTENT_CHUNK_SIZE,
+        IPFSError,
+        ipfs_object_stat,
+        ipfs_open_network_stream,
+        is_plausible_cid,
+    )
+    from starlette.responses import StreamingResponse
+
+    if not FETCH_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+
+    if not is_plausible_cid(cid):
+        raise HTTPException(status_code=400, detail="not a CID")
+
+    # Size gate before any bytes move. object/stat resolves the DAG root and
+    # reads CumulativeSize without transferring content blocks.
+    try:
+        stat = ipfs_object_stat(cid)
+        total = int(stat.get("CumulativeSize", 0))
+    except Exception:
+        # Unresolvable within the API timeout — treat as not found rather
+        # than hanging the request further.
+        raise HTTPException(status_code=404, detail="CID not resolvable")
+
+    if total > FETCH_MAX_BYTES:
+        logger.info("GET /fetch/%s refused: %d bytes exceeds cap %d", cid, total, FETCH_MAX_BYTES)
+        raise HTTPException(status_code=413, detail="object exceeds fetch size cap")
+
+    try:
+        upstream = ipfs_open_network_stream(
+            cid,
+            range_header=request.headers.get("range"),
+            timeout=FETCH_TIMEOUT,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="not a CID")
+    except IPFSError as exc:
+        logger.warning("GET /fetch/%s: %s", cid, exc)
+        raise HTTPException(status_code=504, detail="content not retrievable")
+
+    if upstream.status_code == 416:
+        upstream.close()
+        raise HTTPException(status_code=416, detail="requested range not satisfiable")
+
+    if FETCH_PIN:
+        # Best-effort; the stream is the product, the pin is a bonus.
+        try:
+            import requests as _requests
+            from cipher_station.config import IPFS_API
+            _requests.post(
+                f"{IPFS_API}/api/v0/pin/add",
+                params={"arg": cid},
+                timeout=FETCH_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("GET /fetch/%s: pin failed (continuing): %s", cid, exc)
+
+    headers = {"Accept-Ranges": "bytes"}
+    for header in ("Content-Length", "Content-Range", "ETag"):
+        value = upstream.headers.get(header)
+        if value:
+            headers[header] = value
+
+    def stream():
+        try:
+            for chunk in upstream.iter_content(chunk_size=CONTENT_CHUNK_SIZE):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return StreamingResponse(
+        stream(),
+        status_code=upstream.status_code,
+        headers=headers,
+        media_type="application/octet-stream",
+    )
+
+
+# ---------------------------------------------------------
 # INBOX
 # ---------------------------------------------------------
 @app.post("/inbox")

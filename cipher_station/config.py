@@ -49,6 +49,26 @@ IPFS_MAX_RETRIES = int(os.getenv("IPFS_MAX_RETRIES", "3"))
 # local-only read enforceable (412 instead of a network fetch).
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY_URL", "http://127.0.0.1:8080").rstrip("/")
 
+# GET /fetch/{cid}: owner-authenticated retrieval of arbitrary CIDs through
+# this node's own IPFS connection (bitswap/DHT), bypassing public gateways
+# and their rate limits entirely. Off by default network-wise conservative
+# knobs; see main.py for the route's threat model.
+#   FETCH_ENABLED     — master switch. "true" (default) serves paired
+#                       delegates; "false" turns the route into a plain 404.
+#   FETCH_MAX_BYTES   — refuse objects larger than this (default 512 MB).
+#                       Checked via `ipfs object stat` BEFORE any bytes are
+#                       pulled, so a delegate cannot fill the datastore by
+#                       asking for something enormous.
+#   FETCH_TIMEOUT     — overall seconds allowed for the DHT walk + first
+#                       byte (default 120; large/rare content needs patience
+#                       but a dead CID must not pin a worker forever).
+#   FETCH_PIN         — "true" to keep fetched content pinned locally
+#                       (default "false": fetched blocks are cache, gc-able).
+FETCH_ENABLED = os.getenv("CIPHER_FETCH_ENABLED", "true").lower() == "true"
+FETCH_MAX_BYTES = int(os.getenv("CIPHER_FETCH_MAX_BYTES", str(512 * 1024 * 1024)))
+FETCH_TIMEOUT = int(os.getenv("CIPHER_FETCH_TIMEOUT", "120"))
+FETCH_PIN = os.getenv("CIPHER_FETCH_PIN", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------

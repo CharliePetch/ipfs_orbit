@@ -157,13 +157,21 @@ def ipfs_repo_stat() -> dict:
 def ipfs_object_stat(cid: str) -> dict:
     """
     Get stats for an individual IPFS object.
-    Returns {"Hash": str, "CumulativeSize": int, "DataSize": int, ...}.
+    Returns {"Hash": str, "CumulativeSize": int, "Size": int, ...}.
     CumulativeSize is the total size including linked objects.
+
+    Uses /api/v0/files/stat with an /ipfs/ path: the older
+    /api/v0/object/stat endpoint was REMOVED in kubo 0.28
+    ("removed, use 'ipfs dag' or 'ipfs files' instead"), and files/stat
+    returns the same CumulativeSize while working on both old and new kubo.
+    NOTE: on a CID the node does not hold, this call resolves over the
+    network within IPFS_TIMEOUT — callers using it as a pre-fetch size gate
+    get resolution "for free" as part of the check.
     """
     def _post():
         r = requests.post(
-            f"{IPFS_API}/api/v0/object/stat",
-            params={"arg": cid},
+            f"{IPFS_API}/api/v0/files/stat",
+            params={"arg": f"/ipfs/{quote(cid, safe='')}"},
             timeout=IPFS_TIMEOUT,
         )
         r.raise_for_status()
@@ -292,6 +300,72 @@ def ipfs_open_local_stream(cid: str, *, range_header: str | None = None):
         raise IPFSNotLocal(f"CID not available locally: {cid} (gateway {status})")
 
     raise IPFSError(f"local IPFS gateway returned {status} for {cid}")
+
+
+# ---------------------------------------------------------------------------
+# Network streaming read (backs GET /fetch/{cid})
+# ---------------------------------------------------------------------------
+
+def ipfs_open_network_stream(
+    cid: str,
+    *,
+    range_header: str | None = None,
+    timeout: int | None = None,
+):
+    """
+    Open a STREAMING read of `cid` from this node's own HTTP gateway, ALLOWING
+    a network fetch (bitswap/DHT) when the blocks are not already local.
+
+    This is the deliberate inverse of ``ipfs_open_local_stream``: no
+    ``only-if-cached`` header, so kubo will resolve providers and pull blocks
+    through this node's own peer connections — which is precisely the point.
+    A delegate on a flaky/rate-limited path to the public gateways asks its own
+    station instead; the station fetches over libp2p and streams the bytes
+    down the (authenticated, TLS) station connection.
+
+    The blast-radius controls live in the ROUTE, not here (auth, size cap,
+    enable flag); this function only knows how to move bytes. `timeout`
+    bounds the wait for the response HEADERS (DHT walk + first byte); once
+    streaming has begun, the read is governed by the caller draining
+    ``iter_content``.
+
+    Returns the open ``requests.Response`` — 200, 206 for a satisfied Range,
+    or 416 for an unsatisfiable one. THE CALLER OWNS IT and MUST call
+    ``.close()`` — iterate ``.iter_content()`` inside a try/finally.
+
+    Raises:
+        ValueError — `cid` is not syntactically a CID (never sent anywhere).
+        IPFSError  — the gateway is unreachable, the fetch timed out, or the
+                     gateway answered unexpectedly (unroutable CID, 5xx…).
+    """
+    if not is_plausible_cid(cid):
+        raise ValueError(f"not a CID: {cid!r}")
+
+    headers = {"Accept-Encoding": "identity"}
+    if range_header and is_valid_range_header(range_header):
+        headers["Range"] = range_header
+
+    url = f"{IPFS_GATEWAY}/ipfs/{quote(cid, safe='')}"
+
+    try:
+        resp = requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=timeout or IPFS_TIMEOUT,
+            allow_redirects=False,
+        )
+    except requests.exceptions.Timeout as exc:
+        raise IPFSError(f"network fetch timed out for {cid}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise IPFSError(f"local IPFS gateway unreachable: {exc}") from exc
+
+    if resp.status_code in (200, 206, 416):
+        return resp
+
+    status = resp.status_code
+    resp.close()
+    raise IPFSError(f"gateway returned {status} for network fetch of {cid}")
 
 
 # ---------------------------------------------------------------------------
