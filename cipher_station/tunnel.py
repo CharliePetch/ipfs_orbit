@@ -18,6 +18,7 @@ import requests
 from cipher_station.config import (
     CLOUDFLARE_TUNNEL_ENABLED,
     CLOUDFLARE_METRICS_PORT,
+    CIPHER_PUBLIC_URL,
     PUBLIC_JSON_PATH,
 )
 
@@ -126,7 +127,20 @@ def start_tunnel_monitor():
     Called from the FastAPI startup hook.
     Spawns a daemon thread that monitors the Cloudflare tunnel URL
     and keeps public.json + IPNS in sync.
+
+    When CIPHER_PUBLIC_URL is configured (a permanent named-tunnel/custom-domain
+    URL), that value is published once and quick-tunnel polling is skipped —
+    a stable URL never rotates, so there is nothing to poll for.
     """
+    if CIPHER_PUBLIC_URL:
+        logger.info("Using permanent public URL from CIPHER_PUBLIC_URL: %s", CIPHER_PUBLIC_URL)
+        t = threading.Thread(
+            target=_update_endpoint, args=(CIPHER_PUBLIC_URL,),
+            daemon=True, name="tunnel-monitor",
+        )
+        t.start()
+        return
+
     if not CLOUDFLARE_TUNNEL_ENABLED:
         logger.info("Cloudflare tunnel disabled (CLOUDFLARE_TUNNEL_ENABLED != true)")
         return

@@ -69,6 +69,12 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 CLOUDFLARE_TUNNEL_ENABLED = os.getenv("CLOUDFLARE_TUNNEL_ENABLED", "false").lower() in ("true", "1", "yes")
 CLOUDFLARE_METRICS_PORT = int(os.getenv("CLOUDFLARE_METRICS_PORT", "40469"))
 
+# Permanent public URL (named tunnel / custom domain / static DNS). When set,
+# it wins over quick-tunnel discovery: the tunnel monitor writes THIS value
+# into public.json["endpoint"] and skips the cloudflared metrics polling.
+# Leave unset to use the auto-detected trycloudflare.com quick-tunnel URL.
+CIPHER_PUBLIC_URL = (os.getenv("CIPHER_PUBLIC_URL") or "").strip() or None
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
