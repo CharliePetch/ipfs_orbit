@@ -64,7 +64,11 @@ def test_build_metadata_fields(tmp_path):
     assert md["tags"] == ["Vacation"]
     assert md["client"] == "cli"
     assert md["mime_type"] == "image/jpeg"
-    assert isinstance(md["created_at"], int)
+    import re
+    iso = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
+    assert re.match(iso, md["created_at"])
+    assert re.match(iso, md["file_created_at"])
+    assert re.match(iso, md["file_modified_at"])
 
 
 def test_auth_headers_verify_like_the_server():
