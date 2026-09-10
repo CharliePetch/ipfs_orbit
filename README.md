@@ -264,6 +264,23 @@ cipher station/
 └── tests/                  # Test suite
 ```
 
+## Admin panel
+
+The station serves a localhost-only web admin panel at
+**https://localhost:8443/admin** (no login — access is gated by the loopback
+socket itself; remote requests get 403). It shows live station status
+(public URL, peer ID, IPNS name, IPFS storage, recent pairing PINs), lets you
+edit the station name/profile, tunnel & permanent-URL settings, and the IPFS
+storage cap, and includes a full drive client (browse, preview, upload,
+download, delete) compatible with the CipherVault drive format.
+
+From another machine, use an SSH tunnel:
+
+```bash
+ssh -L 8443:localhost:8443 user@station
+# then open https://localhost:8443/admin locally
+```
+
 ## Managing Your Station
 
 ```bash
