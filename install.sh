@@ -707,6 +707,9 @@ CIPHER_PQC_BACKEND=auto
 # --- Server ---
 CIPHER_PORT=8443
 CIPHER_HOST=0.0.0.0
+# Admin panel: separate listener, ALWAYS bound to 127.0.0.1 (never tunneled).
+# Access needs the per-boot token: cat __CIPHER_STATION_DATA__/panel_token
+CIPHER_PANEL_PORT=8444
 
 # --- TLS ---
 # Auto-generated on first run if missing.
