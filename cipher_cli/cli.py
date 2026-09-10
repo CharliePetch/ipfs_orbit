@@ -33,8 +33,15 @@ Protocol notes (see PROTOCOL.md)
   an envelope re-sealed to this device's ML-KEM public key.
 
 State lives in $CIPHER_CLI_HOME (default ~/.config/cipher-cli/) as
-config.json (0600) holding the device keypairs, device_uid, station URL,
-station uid and station ML-KEM public key.
+config.json (0600, created with that mode — never briefly world-readable)
+holding the device keypairs, device_uid, station URL, station uid and station
+ML-KEM public key.
+
+TLS: `pair --insecure` is for self-signed stations. It does NOT mean "trust
+anything forever": the station's certificate fingerprint is pinned at pairing
+(trust-on-first-use) and every later command refuses to talk to a station
+whose certificate has changed. Without that, a MITM at pairing could hand us
+a substitute ML-KEM key and read every future post's symmetric key.
 """
 
 import argparse
@@ -43,14 +50,16 @@ import hashlib
 import json
 import mimetypes
 import os
-import secrets
+import ssl
 import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 import urllib3
+from nacl.exceptions import CryptoError
 from nacl.secret import SecretBox
 from nacl.utils import random as nacl_random
 
@@ -83,12 +92,30 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    """
+    Write config.json holding secret keys. Created 0600 from the first byte:
+    a plain write_text() would create it under the umask (usually 0644) and
+    only then chmod, leaving a window where the keys are world-readable.
+    Written to a sibling temp file and renamed so a crash never leaves a
+    half-written config behind.
+    """
     home = config_home()
-    home.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(home, 0o700)
     p = config_path()
-    p.write_text(json.dumps(cfg, indent=2))
-    os.chmod(p, 0o600)
+    tmp = p.with_name(p.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(cfg, indent=2))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +125,7 @@ def save_config(cfg: dict) -> None:
 def build_auth_headers(cfg: dict, method: str, path: str, body: bytes) -> dict:
     """Signed x-cipher-* headers for one request over `body`."""
     ts = str(int(time.time()))
-    nonce = secrets.token_urlsafe(16)
+    nonce = uuid.uuid4().hex  # PROTOCOL.md section 12.3: hex nonce
     body_sha = hashlib.sha256(body).hexdigest()
     canonical = "\n".join([
         method.upper(), path, cfg["station_uid"], cfg["device_uid"],
@@ -115,9 +142,45 @@ def build_auth_headers(cfg: dict, method: str, path: str, body: bytes) -> dict:
     }
 
 
+def tls_fingerprint(station_url: str) -> str:
+    """SHA-256 (hex) of the DER certificate the station presents right now."""
+    parts = urlsplit(station_url)
+    host, port = parts.hostname, parts.port or 443
+    if not host:
+        sys.exit(f"Bad station URL: {station_url}")
+    pem = ssl.get_server_certificate((host, port))
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    return hashlib.sha256(der).hexdigest()
+
+
+def check_pinned_cert(cfg: dict) -> None:
+    """
+    Trust-on-first-use for --insecure stations: the certificate seen at pairing
+    is the only one we will ever talk to. A changed fingerprint is treated as an
+    attack, not an inconvenience — re-pair deliberately if the station's cert
+    really did change.
+    """
+    if cfg.get("verify_tls", True):
+        return
+    pinned = cfg.get("tls_fingerprint_sha256")
+    if not pinned:
+        sys.exit("Config has verify_tls=false but no pinned certificate. Re-run: cipher pair --insecure --force")
+    seen = tls_fingerprint(cfg["station_url"])
+    if seen != pinned:
+        sys.exit(
+            "REFUSING TO CONNECT: the station's TLS certificate has changed.\n"
+            f"  pinned: {pinned}\n"
+            f"  seen:   {seen}\n"
+            "If you replaced the station's certificate on purpose, re-pair with\n"
+            "'cipher pair --insecure --force'. Otherwise someone may be intercepting\n"
+            "the connection."
+        )
+
+
 def _session(cfg: dict) -> requests.Session:
     s = requests.Session()
     if not cfg.get("verify_tls", True):
+        check_pinned_cert(cfg)
         s.verify = False
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return s
@@ -134,7 +197,8 @@ def signed_request(cfg: dict, method: str, path: str, body: bytes = b"",
                      headers=headers, timeout=120, stream=stream)
     if resp.status_code >= 400:
         try:
-            detail = resp.json().get("detail")
+            payload = resp.json()
+            detail = payload.get("detail") or payload.get("error") or resp.text[:200]
         except Exception:
             detail = resp.text[:200]
         sys.exit(f"{method} {path} failed: HTTP {resp.status_code}: {detail}")
@@ -154,14 +218,29 @@ def signed_json(cfg: dict, method: str, path: str, obj: dict | None = None) -> d
 # Multipart encoding (built by hand so the exact body bytes can be signed)
 # ---------------------------------------------------------------------------
 
+BLOB_FILENAME = "blob"
+
+
+def _mp_token(value: str) -> str:
+    """A value safe to interpolate into a multipart header (no quotes/CRLF)."""
+    return "".join(c for c in value if c not in '"\r\n')
+
+
 def encode_multipart(fields: dict[str, str], file_field: str,
                      filename: str, file_bytes: bytes) -> tuple[bytes, str]:
+    """
+    Hand-rolled multipart/form-data so the exact wire bytes can be hashed into
+    the signature. `filename` goes into the Content-Disposition header, which
+    is NOT encrypted — callers must pass BLOB_FILENAME (not the user's real
+    filename, which lives only inside the encrypted metadata).
+    """
     boundary = "----cipher-cli-" + uuid.uuid4().hex
+    filename = _mp_token(filename)
     parts = []
     for name, value in fields.items():
         parts.append(
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f'Content-Disposition: form-data; name="{_mp_token(name)}"\r\n\r\n'
             f"{value}\r\n".encode("utf-8")
         )
     parts.append(
@@ -203,15 +282,20 @@ def build_metadata(file_path: Path, *, folder: str | None, filename: str | None,
                    client: str = CLIENT_NAME) -> dict:
     name = filename or file_path.name
     mime, _ = mimetypes.guess_type(name)
+    st = file_path.stat()
+    # st_ctime is inode-change time on POSIX, not creation; prefer the real
+    # birth time where the platform exposes it, else fall back to mtime.
+    born = getattr(st, "st_birthtime", None) or st.st_mtime
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))  # noqa: E731
     return {
         "mime_type": mime or "application/octet-stream",
         "filename": name,
-        "size_bytes": file_path.stat().st_size,
-        "extension": file_path.suffix.lstrip(".").lower(),
+        "size_bytes": st.st_size,
+        "extension": Path(name).suffix.lstrip(".").lower(),
         "tags": [folder] if folder else [],
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "file_created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file_path.stat().st_ctime)),
-        "file_modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(file_path.stat().st_mtime)),
+        "created_at": iso(time.time()),
+        "file_created_at": iso(born),
+        "file_modified_at": iso(st.st_mtime),
         "client": client,
         "client_version": __version__,
     }
@@ -227,7 +311,7 @@ def fetch_manifest(cfg: dict) -> dict:
     prof.raise_for_status()
     manifest_cid = prof.json().get("manifest_cid") or prof.json().get("manifest_pointer")
     if not manifest_cid:
-        sys.exit("Station profile has no manifest_cid")
+        return {"clients": {}}  # nothing published yet
     resp = signed_request(cfg, "GET", f"/content/{manifest_cid}")
     return json.loads(resp.content.decode("utf-8"))
 
@@ -283,6 +367,17 @@ def cmd_pair(args) -> None:
     station = args.station.rstrip("/")
     verify_tls = not args.insecure
 
+    if config_path().exists() and not args.force:
+        sys.exit(f"{config_path()} already exists (this device is paired). "
+                 "Re-run with --force to replace that identity.")
+
+    pinned = None
+    if not verify_tls:
+        pinned = tls_fingerprint(station)
+        print("WARNING: --insecure: TLS certificate NOT verified against a CA.")
+        print(f"         Pinning this station's certificate (sha256 {pinned[:16]}...).")
+        print("         Future commands will refuse a station whose certificate changes.")
+
     print("Generating device identity (ML-KEM-768 + ML-DSA-65)...")
     mlkem_pk, mlkem_sk = pqcrypto.generate_mlkem_keypair()
     mldsa_pk, mldsa_sk = pqcrypto.generate_mldsa_keypair()
@@ -319,6 +414,7 @@ def cmd_pair(args) -> None:
     save_config({
         "station_url": station,
         "verify_tls": verify_tls,
+        "tls_fingerprint_sha256": pinned,
         "station_uid": station_uid,
         "station_mlkem_public_key": profile["mlkem_public_key"],
         "station_mldsa_public_key": profile.get("mldsa_public_key"),
@@ -357,7 +453,9 @@ def cmd_post(args) -> None:
         fields["self_envelope"] = self_envelope
     fields["metadata"] = meta_field
 
-    body, ctype = encode_multipart(fields, "file", metadata["filename"], upload)
+    # The real filename stays inside the encrypted metadata; the multipart
+    # header (which is plaintext on the wire) carries a fixed placeholder.
+    body, ctype = encode_multipart(fields, "file", BLOB_FILENAME, upload)
     result = signed_request(cfg, "POST", "/post", body, ctype).json()
     print(result["cid"])
 
@@ -382,7 +480,8 @@ def cmd_list(args) -> None:
             created = time.strftime("%Y-%m-%d %H:%M", time.localtime(created))
         rows.append([
             client_name, cid, str(md.get("filename", "?")),
-            str(md.get("size_bytes", "?")), ",".join(md.get("tags") or []),
+            str(md.get("size_bytes", "?")),
+            ",".join(str(t) for t in (md.get("tags") if isinstance(md.get("tags"), list) else [])),
             str(created or "?"),
         ])
     if not rows:
@@ -422,9 +521,27 @@ def cmd_get(args) -> None:
         if isinstance(meta, str) and meta:
             md = decrypt_metadata(meta, sym) or {}
 
-    out = Path(args.output) if args.output else Path(md.get("filename") or args.cid)
+    out = output_path_for(md, args.cid, args.output)
     out.write_bytes(plaintext)
     print(f"Wrote {len(plaintext)} bytes to {out}")
+
+
+def output_path_for(md: dict, cid: str, output: str | None) -> Path:
+    """
+    Where `get` writes. An explicit -o is honoured as given. Otherwise the
+    name comes from DECRYPTED METADATA — which another paired device wrote —
+    so it is reduced to a bare basename (no directories, no '..') inside the
+    current directory, and an existing file is never overwritten silently.
+    """
+    if output:
+        return Path(output)
+    name = Path(str(md.get("filename") or "")).name
+    if name in ("", ".", ".."):
+        name = cid
+    out = Path.cwd() / name
+    if out.exists():
+        sys.exit(f"Refusing to overwrite existing {out}; pass -o to choose a path")
+    return out
 
 
 def cmd_delete(args) -> None:
@@ -448,6 +565,8 @@ def main(argv=None) -> None:
                     help="skip TLS certificate verification (self-signed stations)")
     sp.add_argument("--name", default="cipher-cli", help="device name prefix")
     sp.add_argument("--pin", help="6-digit PIN (otherwise prompted)")
+    sp.add_argument("--force", action="store_true",
+                    help="replace an existing pairing for this device")
     sp.set_defaults(func=cmd_pair)
 
     sp = sub.add_parser("post", help="encrypt and publish a file")
@@ -474,7 +593,17 @@ def main(argv=None) -> None:
     sp.set_defaults(func=cmd_delete)
 
     args = p.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except requests.exceptions.SSLError as exc:
+        sys.exit(f"TLS error talking to the station: {exc}\n"
+                 "(self-signed certificate? pair with --insecure to pin it)")
+    except requests.exceptions.RequestException as exc:
+        sys.exit(f"Could not reach the station: {exc}")
+    except CryptoError:
+        sys.exit("Decryption failed: the post's key does not match its bytes")
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
 if __name__ == "__main__":
