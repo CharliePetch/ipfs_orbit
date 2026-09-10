@@ -2,6 +2,7 @@ import os
 os.environ["PYTHONNOUSERSITE"] = "1"
 
 import asyncio
+import socket
 import subprocess
 import logging
 from pathlib import Path
@@ -40,6 +41,45 @@ def _ensure_ssl_cert():
     logger.info(f"Certificate written to {cert}")
 
 
+def _bind_panel_socket(host: str, port: int) -> socket.socket | None:
+    """
+    Bind the admin panel's listening socket up front, so a port clash is a
+    logged warning rather than a fatal error. uvicorn calls sys.exit(3) when
+    it cannot bind, and inside asyncio.gather that would take the STATION
+    down with it — turning "something else is on 8444" into "the station no
+    longer boots" after an upgrade. The panel is a convenience; the station
+    is the product. Returns None (panel skipped) when the port is taken.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError as exc:
+        sock.close()
+        logger.error(
+            "Admin panel NOT started: cannot bind %s:%d (%s). The station is "
+            "running normally without it; set CIPHER_PANEL_PORT to a free port "
+            "and restart to enable the panel.", host, port, exc,
+        )
+        return None
+    return sock
+
+
+async def _serve_panel(panel: "uvicorn.Server", sock: socket.socket) -> None:
+    """Run the panel server; never let its failure escape into gather()."""
+    try:
+        await panel.serve(sockets=[sock])
+    except SystemExit as exc:  # uvicorn's startup failure path
+        logger.error("Admin panel exited at startup (code %s); station continues.", exc.code)
+    except Exception:  # noqa: BLE001 — anything else is equally non-fatal
+        logger.exception("Admin panel crashed; station continues without it.")
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 async def _serve():
     """
     Two uvicorn servers in one process:
@@ -48,7 +88,8 @@ async def _serve():
       cloudflared / clients ever talk to;
     - the admin panel on 127.0.0.1:CIPHER_PANEL_PORT (plain HTTP,
       proxy_headers disabled so request.client is always the real socket
-      peer). The panel is never reachable through the tunnel.
+      peer). The panel is never reachable through the tunnel, and its
+      failure to start is never allowed to stop the station.
     """
     station_config = uvicorn.Config(
         "cipher_station.main:app",
@@ -73,8 +114,14 @@ async def _serve():
     )
 
     station = uvicorn.Server(station_config)
-    panel = uvicorn.Server(panel_config)
-    await asyncio.gather(station.serve(), panel.serve())
+    tasks = [station.serve()]
+
+    panel_sock = _bind_panel_socket(CIPHER_PANEL_HOST, CIPHER_PANEL_PORT)
+    if panel_sock is not None:
+        panel = uvicorn.Server(panel_config)
+        tasks.append(_serve_panel(panel, panel_sock))
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

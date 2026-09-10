@@ -186,10 +186,25 @@ def api_drive_file(post_cid: str, download: bool = False):
         # Non-media types never render in the browser: opaque download only.
         mime = "application/octet-stream"
     disposition = "inline" if (inline_ok and not download) else "attachment"
-    safe_name = str(filename).replace('"', "")
     headers = _content_security_headers()
-    headers["Content-Disposition"] = f'{disposition}; filename="{safe_name}"'
+    headers["Content-Disposition"] = _content_disposition(disposition, str(filename))
     return Response(content=plaintext, media_type=mime, headers=headers)
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    """
+    RFC 6266 / RFC 5987 Content-Disposition. HTTP headers are Latin-1 on the
+    wire (Starlette raises on anything else), and filenames come from
+    device-written metadata — so a CJK or emoji name must not 500 the route.
+    ASCII fallback in `filename=`, full UTF-8 name percent-encoded in
+    `filename*=` for browsers that understand it (all current ones).
+    """
+    from urllib.parse import quote
+    clean = filename.replace("\r", "").replace("\n", "").replace('"', "")
+    ascii_name = clean.encode("ascii", "replace").decode("ascii").replace("?", "_") or "file"
+    if ascii_name == clean:
+        return f'{disposition}; filename="{ascii_name}"'
+    return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(clean, safe='')}"
 
 
 _UPLOAD_CHUNK = 1024 * 1024

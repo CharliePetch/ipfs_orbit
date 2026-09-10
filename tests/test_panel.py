@@ -737,3 +737,57 @@ class TestDrive:
         assert len(obj["files"]) == 1
         assert len(obj["errors"]) == 1
         assert obj["errors"][0]["post_cid"].startswith("QmBroken")
+
+
+# ---------------------------------------------------------------------------
+# 6. Startup: the panel must never take the station down
+# ---------------------------------------------------------------------------
+
+class TestPanelStartup:
+    def test_busy_port_skips_panel_instead_of_exiting(self, caplog):
+        """uvicorn sys.exit(3)s on a bind failure; inside asyncio.gather that
+        would kill the station. The pre-bind must turn it into a logged skip."""
+        import run as run_mod
+        taken = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        try:
+            with caplog.at_level("ERROR"):
+                assert run_mod._bind_panel_socket("127.0.0.1", port) is None
+            assert any("Admin panel NOT started" in r.getMessage() for r in caplog.records)
+        finally:
+            taken.close()
+
+    def test_free_port_yields_a_bound_loopback_socket(self):
+        import run as run_mod
+        sock = run_mod._bind_panel_socket("127.0.0.1", 0)
+        try:
+            assert sock is not None
+            host, port = sock.getsockname()
+            assert host == "127.0.0.1" and port > 0
+        finally:
+            sock.close()
+
+
+class TestNonAsciiFilenames:
+    def test_unicode_filename_downloads_with_rfc5987_header(self, panel_app):
+        """HTTP headers are Latin-1; a CJK/emoji name from device metadata
+        must not 500 the download route."""
+        name = "résumé 日本.pdf"
+        _, _, raw = upload(panel_app, name, b"%PDF-1.4 x")
+        post_cid = json.loads(raw)["post_cid"]
+        status, headers, body = call_panel(
+            panel_app, "GET", f"/admin/api/drive/file/{post_cid}", query=b"download=true")
+        assert status == 200
+        assert body == b"%PDF-1.4 x"
+        cd = headers["content-disposition"]
+        assert cd.startswith('attachment; filename="r_sum_ __.pdf"')  # ASCII fallback
+        assert "filename*=UTF-8''r%C3%A9sum%C3%A9%20%E6%97%A5%E6%9C%AC.pdf" in cd
+
+    def test_ascii_filename_header_is_unchanged(self, panel_app):
+        _, _, raw = upload(panel_app, "plain.pdf", b"%PDF-1.4 y")
+        post_cid = json.loads(raw)["post_cid"]
+        _, headers, _ = call_panel(
+            panel_app, "GET", f"/admin/api/drive/file/{post_cid}", query=b"download=true")
+        assert headers["content-disposition"] == 'attachment; filename="plain.pdf"'
