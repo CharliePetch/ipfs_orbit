@@ -49,6 +49,37 @@ IPFS_MAX_RETRIES = int(os.getenv("IPFS_MAX_RETRIES", "3"))
 # local-only read enforceable (412 instead of a network fetch).
 IPFS_GATEWAY = os.getenv("IPFS_GATEWAY_URL", "http://127.0.0.1:8080").rstrip("/")
 
+# GET /fetch/{cid}: owner-authenticated retrieval of arbitrary CIDs through
+# this node's own IPFS connection (bitswap/DHT), bypassing public gateways
+# and their rate limits entirely. The route is ENABLED by default (it only
+# serves the owner's own paired devices); the knobs that affect the node's
+# footprint (pinning) default to the conservative side. See main.py for the
+# route's threat model.
+#   FETCH_ENABLED        — master switch. "true" (default) serves paired
+#                          delegates; "false" turns the route into a plain 404.
+#   FETCH_MAX_BYTES      — refuse objects larger than this (default 512 MB).
+#                          Checked via `ipfs files stat` BEFORE any content
+#                          blocks are pulled, so a delegate cannot fill the
+#                          datastore by asking for something enormous.
+#   FETCH_TIMEOUT        — seconds allowed for EACH of the two network waits
+#                          (root resolution for the size check, then DHT walk
+#                          + first byte of the stream). Default 120; a dead
+#                          CID costs at most ~2x this, never a worker forever.
+#   FETCH_MAX_CONCURRENT — how many /fetch requests may be in flight at once
+#                          (default 4). Every fetch holds a threadpool worker
+#                          for its whole DHT walk + stream; without a cap a
+#                          handful of dead CIDs could starve every other
+#                          route. Excess requests get 503 + Retry-After.
+#   FETCH_PIN            — "true" to keep fetched content pinned locally
+#                          (default "false": fetched blocks are cache, gc-able).
+#                          Pinning happens AFTER the stream has been fully
+#                          delivered, never on the request's critical path.
+FETCH_ENABLED = os.getenv("CIPHER_FETCH_ENABLED", "true").lower() == "true"
+FETCH_MAX_BYTES = int(os.getenv("CIPHER_FETCH_MAX_BYTES", str(512 * 1024 * 1024)))
+FETCH_TIMEOUT = int(os.getenv("CIPHER_FETCH_TIMEOUT", "120"))
+FETCH_MAX_CONCURRENT = int(os.getenv("CIPHER_FETCH_MAX_CONCURRENT", "4"))
+FETCH_PIN = os.getenv("CIPHER_FETCH_PIN", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------

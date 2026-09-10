@@ -198,8 +198,33 @@ install_system_deps() {
 }
 
 # Open the Cipher Station port with whatever firewall the distro ships (best-effort).
+#
+# HARD RULE for this function: enabling a deny-by-default firewall on a box
+# that already runs OTHER services must not silently break them. This is not
+# theoretical either: enabling ufw on a home server took down a Jellyfin
+# instance (native systemd, port 8096) and its companion services — the
+# install looked perfect and every OTHER service on the machine went dark.
+# Docker-published ports survive (docker inserts its own iptables chains ahead
+# of ufw), which makes the breakage extra confusing: containerized apps keep
+# working while native ones vanish.
 configure_firewall() {
     if command -v ufw >/dev/null 2>&1; then
+        # Snapshot BEFORE we touch anything: was ufw already active, and what
+        # is already listening on non-loopback addresses? `ss` field 4 is the
+        # local addr:port; strip the addr, keep unique ports. Exclude 22 and
+        # our own ports — they are handled explicitly below.
+        UFW_WAS_ACTIVE="$(sudo ufw status 2>/dev/null | grep -q 'Status: active' && echo yes || echo no)"
+        EXISTING_PORTS=""
+        if [ "$UFW_WAS_ACTIVE" = "no" ]; then
+            EXISTING_PORTS="$(ss -tlnH 2>/dev/null \
+                | awk '{print $4}' \
+                | grep -v '^127\.\|^\[::1\]' \
+                | sed 's/.*://' \
+                | sort -un \
+                | grep -v -w -e 22 -e "${CIPHER_PORT}" -e 4001 \
+                | tr '\n' ' ')"
+        fi
+
         # SSH MUST be allowed before ufw is enabled. ufw's default incoming
         # policy is deny, so enabling it with only the station port open
         # black-holes port 22 — and that is not a theoretical footgun:
@@ -230,6 +255,29 @@ configure_firewall() {
         # service on the same port.
         sudo ufw allow 4001/tcp comment "IPFS swarm" 2>/dev/null || true
         sudo ufw allow 4001/udp comment "IPFS swarm (QUIC)" 2>/dev/null || true
+
+        # Preserve whatever else this box was already serving — but only when
+        # WE are the ones flipping ufw from inactive to active. If the
+        # operator had ufw active already, their ruleset is their policy and
+        # we do not second-guess it.
+        # Scope: RFC1918 + link-local sources only. These are pre-existing LAN
+        # services (a media server, a NAS web UI); re-exposing them exactly as
+        # reachable as they were on the LAN is preserving the status quo,
+        # while opening them to the internet would be widening it — the
+        # opposite failure. An operator who wants one of them world-reachable
+        # can widen that rule themselves.
+        if [ "$UFW_WAS_ACTIVE" = "no" ] && [ -n "$EXISTING_PORTS" ]; then
+            warn "ufw is about to be ENABLED (default deny) on a box with pre-existing services."
+            for port in $EXISTING_PORTS; do
+                for src in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+                    sudo ufw allow from "$src" to any port "$port" proto tcp \
+                        comment "pre-existing service (cipher station installer)" >/dev/null 2>&1 || true
+                done
+                warn "  preserved pre-existing listener: ${port}/tcp (LAN-only)"
+            done
+            warn "Review with 'sudo ufw status numbered' — delete any rule you don't want."
+        fi
+
         sudo ufw --force enable 2>/dev/null || true
         ok "Firewall (ufw): SSH + ${CIPHER_PORT}/tcp + 4001/tcp+udp (IPFS swarm) allowed"
     elif command -v firewall-cmd >/dev/null 2>&1; then

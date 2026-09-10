@@ -38,16 +38,18 @@ Each post gets its own random symmetric key. That key is wrapped in a **post-qua
 - **Zero-config public access** — Optional Cloudflare Quick Tunnel gives you a public HTTPS URL with no port forwarding.
 - **Multi-client architecture** — One identity, many apps. Photo sharing (cipherframe), file storage (ciphervault), and more — all sharing the same encryption and social graph.
 - **Device pairing** — Pair your phone or laptop as a delegate device via 6-digit PIN. Access your content from anywhere.
+- **Command-line client** — `./cipher` pairs as a delegate and can post, list, fetch and delete from any shell. See [Command-Line Client](#command-line-client).
+- **Station-side fetch** — Paired devices can ask the station to retrieve any CID over its own IPFS connection instead of leaning on rate-limited public gateways.
 - **Encrypted social graph** — Your follower and following lists are encrypted before being published to IPFS.
 - **One-click install** — Single script sets up everything on a Raspberry Pi: IPFS, Python, systemd services, firewall, identity.
 
 ## Quick Start
 
-### Raspberry Pi (Recommended)
+### Raspberry Pi / Linux (Recommended)
 
 ```bash
-git clone https://github.com/your-username/cipher station.git
-cd cipher station
+git clone https://github.com/CharliePetch/cipher-station.git
+cd cipher-station
 chmod +x install.sh
 ./install.sh
 ```
@@ -55,9 +57,15 @@ chmod +x install.sh
 The installer handles everything:
 1. Installs Python 3.11+, IPFS (Kubo), and cloudflared
 2. Creates a Python virtual environment with all dependencies
-3. Bootstraps your cryptographic identity (Curve25519 keypair + UUID)
-4. Configures and starts systemd services (IPFS, Cipher Station, Cloudflare tunnel)
-5. Opens the firewall and prints your Peer ID
+3. Bootstraps your post-quantum identity (ML-KEM-768 + ML-DSA-65 keypairs + UUID)
+4. Configures and starts systemd services (IPFS, Cipher Station, Cloudflare tunnel, daily USB backup)
+5. Opens the firewall (SSH, the station port, and the IPFS swarm port — pre-existing LAN services are preserved) and prints your Peer ID
+
+Optional flags: `--restore` to rebuild from a USB backup (see [Backup & Restore](#backup--restore)), and `CIPHER_AUTO_UPDATE=true ./install.sh` to opt a self-hosted station into the health-gated auto-updater.
+
+### macOS
+
+Double-click `install-macos.command` in Finder. It installs IPFS and cloudflared under `~/.cipherstation`, registers `launchd` services, and adds a menu-bar app showing pairing PINs, the tunnel URL and storage. See [MACOS.md](MACOS.md).
 
 After install, your station is live. Share your **Peer ID** with followers — they can always find you at:
 
@@ -70,31 +78,40 @@ https://ipfs.io/ipns/<your-peer-id>
 ```bash
 # Prerequisites: Python 3.11+, IPFS daemon running on localhost:5001
 
-git clone https://github.com/your-username/cipher station.git
-cd cipher station
+git clone https://github.com/CharliePetch/cipher-station.git
+cd cipher-station
 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env
-# Edit .env as needed
-
+# Optional: create a .env with any of the settings below
 python run.py
 ```
 
+`run.py` generates a self-signed TLS certificate on first start and listens on `https://0.0.0.0:8443`.
+
 ## Configuration
 
-Copy `.env.example` to `.env` and customize:
+Settings are read from the environment or a `.env` file in the project root (the installer writes one). Everything has a working default:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CIPHER_PORT` | `8443` | HTTPS port |
-| `CIPHER_PANEL_PORT` | `8444` | Admin panel port (always bound to 127.0.0.1) |
-| `CIPHER_PASSWORD` | _(empty)_ | Encrypt your private key at rest |
+| `CIPHER_HOST` | `0.0.0.0` | Bind address |
+| `CIPHER_PANEL_PORT` | `8444` | Admin panel port (always bound to 127.0.0.1; see [Admin panel](#admin-panel)) |
+| `CIPHER_BASE_DIR` | `./cipher_station_data` | Where keys, DB, manifests and TLS certs live |
+| `CIPHER_PASSWORD` | _(empty)_ | Encrypt the station's private keys at rest (Argon2i) |
+| `CIPHER_PQC_BACKEND` | `auto` | `auto` / `liboqs` / `python` — see [constant-time backend](#optional-constant-time-backend-liboqs) |
 | `CLOUDFLARE_TUNNEL_ENABLED` | `false` | Enable zero-config public access |
-| `IPFS_API_URL` | `http://127.0.0.1:5001` | Local IPFS daemon |
+| `IPFS_API_URL` | `http://127.0.0.1:5001` | Local IPFS daemon RPC |
+| `IPFS_GATEWAY_URL` | `http://127.0.0.1:8080` | Local IPFS gateway (used to stream content) |
 | `MAX_UPLOAD_SIZE` | `104857600` | Max upload size (100 MB) |
+| `CIPHER_FETCH_ENABLED` | `true` | Serve `GET /fetch/{cid}` to paired devices |
+| `CIPHER_FETCH_MAX_BYTES` | `536870912` | Refuse fetches larger than this (512 MB) |
+| `CIPHER_FETCH_MAX_CONCURRENT` | `4` | In-flight fetches before the station answers 503 |
+| `CIPHER_FETCH_PIN` | `false` | Pin fetched content instead of leaving it as GC-able cache |
+| `CIPHER_BACKUP_DEST` | _(auto-detect USB)_ | Fixed destination for the daily backup |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
 See [PROTOCOL.md](PROTOCOL.md) Appendix B for the full configuration reference.
@@ -111,7 +128,7 @@ See [PROTOCOL.md](PROTOCOL.md) Appendix B for the full configuration reference.
  +-------------------------------------------+
  |  Content Encryption Layer                  |  Per-post symmetric + envelopes
  +-------------------------------------------+
- |  Identity Layer                            |  Curve25519 keypairs, UIDs
+ |  Identity Layer                            |  ML-KEM-768 + ML-DSA-65 keypairs, UIDs
  +-------------------------------------------+
  |  Discovery Layer (IPNS)                    |  Permanent station addresses
  +-------------------------------------------+
@@ -159,15 +176,25 @@ pip install oqs            # builds/links liboqs; needs cmake + a C compiler
 |----------|------|-------------|
 | `GET /profile` | None | Public identity document (uid, ML-KEM + ML-DSA public keys, peer ID, manifest pointer) |
 | `GET /health` | None | Station health check |
+| `GET /storage` | None | IPFS repo, disk and per-client usage |
 | `POST /inbox` | None* | Receive follow requests |
-| `POST /post` | Signature | Create a post (`audience_mode`: `self` / `specific` / `all` / `public`) |
-| `POST /rewrap` | Signature | Get a device-specific envelope |
-| `POST /follow` | Signature | Follow another user |
-| `POST /unfollow` | Signature | Unfollow a user |
 | `POST /delegate/start` | None | Initiate device pairing |
 | `POST /delegate/confirm` | None | Confirm pairing with PIN |
+| `POST /post` | Owner | Create a post (`audience_mode`: `self` / `specific` / `all` / `public`) |
+| `POST /post/delete` | Owner | Remove a post from the manifest and unpin it |
+| `POST /post/share` | Owner | Re-share an existing post to a new audience |
+| `POST /rewrap` | Owner | Get a post's key re-sealed to this device's ML-KEM key |
+| `GET /content/{cid}` | Owner | Stream bytes this station published (local-only, supports `Range`) |
+| `GET /fetch/{cid}` | Owner | Retrieve **any** CID over the station's own IPFS connection (size-capped, rate-limited) |
+| `POST /profile/update`, `POST /profile/avatar` | Owner | Edit the public profile |
+| `POST /privacy/flip` | Owner | Switch the account between private and public |
+| `GET /followers`, `GET /followers/pending` | Owner | List followers / pending requests |
+| `POST /followers/approve`, `POST /followers/remove` | Owner | Manage followers |
+| `GET /following`, `POST /follow`, `POST /unfollow` | Owner | Manage who you follow |
 
 \* Follow requests are unauthenticated; other inbox message types require a signature.
+
+**Owner** routes require a signed request from one of the station owner's paired delegate devices; a follower's device is rejected with 403. Full request/response shapes are in [PROTOCOL.md](PROTOCOL.md) Section 14.
 
 **Authenticated requests** are signed with the device's **ML-DSA-65** key. The client sends `x-cipher-uid`, `x-cipher-device`, `x-cipher-ts`, `x-cipher-nonce`, `x-cipher-body-sha256`, and `x-cipher-sig` (base64 ML-DSA signature over the canonical string `METHOD\nPATH\nUID\nDEVICE_UID\nTS\nNONCE\nBODY_SHA256`). The station verifies the signature against the device's stored public key; a ±60 s timestamp window and a one-time nonce store prevent replay.
 
@@ -192,7 +219,7 @@ https://ipfs.io/ipfs/<post_cid>
 
 ## IPNS Discovery
 
-Every Cipher Station station publishes its `public.json` to IPNS under its IPFS Peer ID. This creates a **permanent, location-independent address** for your station:
+Every Cipher Station publishes its `public.json` to IPNS under its IPFS Peer ID. This creates a **permanent, location-independent address** for your station:
 
 ```
 Peer ID (never changes)  -->  IPNS  -->  /ipfs/<CID>  -->  public.json
@@ -204,6 +231,30 @@ Clients discover stations in priority order:
 3. **Public gateway** — last resort: `https://ipfs.io/ipns/<peer-id>`
 
 This means you can move your Pi to a new network, get a new tunnel URL, or change ISPs — followers will still find you.
+
+## Command-Line Client
+
+`./cipher` is a small stdlib client that speaks the full delegate protocol from any shell: it pairs as one of your devices, encrypts on your machine, and never hands the station plaintext or a key outside a post-quantum envelope.
+
+```bash
+# Pair once. The 6-digit PIN appears in the station's log (or the macOS menu bar).
+./cipher pair --station https://<station>:8443
+./cipher pair --station https://<station>:8443 --insecure   # self-signed cert: pins it (TOFU)
+
+# Publish, browse, fetch, remove
+./cipher post ~/Photos/trip.jpg --folder Trips --audience self
+./cipher post notes.md --audience public
+./cipher post file.bin --client drive              # land it in the CipherVault bucket
+./cipher list
+./cipher get <cid>                                 # writes the original filename in the cwd
+./cipher get <cid> -o /tmp/out.bin
+./cipher delete <cid>
+```
+
+- Keys and the station address live in `~/.config/cipher-cli/config.json` (mode 0600; override the directory with `CIPHER_CLI_HOME`).
+- `--insecure` does not mean "trust anything": the station's certificate fingerprint is pinned at pairing and later commands refuse a station whose certificate changed. Re-pair with `--force` if you replaced the certificate on purpose.
+- `--folder` becomes a `tags` entry inside the encrypted metadata, matching the drive client's folder convention. The real filename never appears on the wire.
+- `list` and `get` recover each post's key through `POST /rewrap`, so the CLI can read posts made by your other devices too.
 
 ## Multi-Client Design
 
@@ -230,37 +281,50 @@ Building a new client? Pick a name, define your metadata schema, and post to you
 ## Project Structure
 
 ```
-cipher station/
-├── install.sh              # One-click Raspberry Pi installer
+cipher-station/
+├── install.sh              # One-click Raspberry Pi / Linux installer
+├── install-macos.command   # macOS installer (launchd services + menu bar app)
 ├── run.py                  # Entry point (uvicorn + TLS)
+├── cipher                  # Command-line client entry script
 ├── requirements.txt        # Python dependencies
-├── .env.example            # Configuration template
-├── PROTOCOL.md             # Full protocol specification
+├── README.md, PROTOCOL.md, CLIENT_FAQ.md, MACOS.md
+├── brand/                  # Logo, icons and BRAND.md
+├── scripts/
+│   └── cipher-updater.sh   # Health-gated auto-updater (systemd timer)
 ├── cipher_station/
 │   ├── main.py             # FastAPI app and routes
 │   ├── pqcrypto.py         # Post-quantum primitives (ML-KEM-768, ML-DSA-65)
+│   ├── crypto.py           # Key-at-rest encryption (Argon2i + SecretBox)
 │   ├── identity.py         # PQC keypair generation and loading
 │   ├── posts.py            # Post creation and encryption
 │   ├── envelopes.py        # ML-KEM envelope create/open
-│   ├── manifest.py         # Manifest serialization
+│   ├── manifest.py         # Manifest serialization and publishing
+│   ├── ipns_publisher.py   # Background IPNS publishing (off the request path)
 │   ├── rewrap.py           # Delegate envelope rewrap
+│   ├── rewrap_envelopes.py # Re-issue every envelope after a follower change
 │   ├── auth.py             # ML-DSA signature authentication
 │   ├── inbox.py            # Follow request handling
 │   ├── pairing.py          # Device pairing (PIN)
 │   ├── graph.py            # Social graph encryption
 │   ├── followers.py        # Follower database ops
 │   ├── following.py        # Following database ops
-│   ├── ipfs_client.py      # IPFS/IPNS API wrapper
+│   ├── privacy.py          # Private <-> public account flips
+│   ├── ipfs_client.py      # IPFS/IPNS API wrapper (local + network streaming)
 │   ├── tunnel.py           # Cloudflare tunnel monitor
 │   ├── profile.py          # /profile endpoint
+│   ├── storage.py          # Atomic, locked JSON state writes
 │   ├── config.py           # Configuration loading
 │   ├── backup.py           # USB backup & restore (create/restore CLI)
+│   ├── tray.py             # macOS menu bar app
 │   └── database.py         # SQLite schema
-├── cipher_station_data/             # Runtime data (created on first run)
+├── cipher_cli/
+│   └── cli.py              # Command-line client (pair / post / list / get / delete)
+├── cipher_station_data/    # Runtime data (created on first run; CIPHER_BASE_DIR)
 │   ├── keys/mlkem.bin      # Station ML-KEM-768 keypair (content)
 │   ├── keys/mldsa.bin      # Station ML-DSA-65 keypair (auth)
 │   ├── public.json         # Public identity (uid, mlkem/mldsa public keys)
-│   ├── cipherstation.db            # SQLite database
+│   ├── manifests/          # Client manifests
+│   ├── cipherstation.db    # SQLite database
 │   └── ssl/                # TLS certificates
 └── tests/                  # Test suite
 ```
@@ -304,20 +368,22 @@ ssh -L 8444:localhost:8444 user@station
 
 ```bash
 # Check status
-sudo systemctl status cipher station
+sudo systemctl status cipherstation
 
-# View logs
-sudo journalctl -u cipher station -f
+# View logs (pairing PINs appear here)
+sudo journalctl -u cipherstation -f
 
 # Restart
-sudo systemctl restart cipher station
+sudo systemctl restart cipherstation
 
 # View IPFS peer ID
 ipfs id -f='<id>'
 
-# Check tunnel URL
-sudo journalctl -u cloudflared-tunnel -f
+# Current tunnel URL (also shown by the installer and in public.json "endpoint")
+sudo journalctl -u cipherstation -f | grep 'Tunnel endpoint'
 ```
+
+Hosted stations, and self-hosted ones installed with `CIPHER_AUTO_UPDATE=true`, run `cipherstation-updater.timer`: it checks out the pinned commit, re-runs the installer, and rolls back automatically if `/health` does not come back.
 
 ## Backup & Restore
 
@@ -372,6 +438,8 @@ will be prompted for.) The archive format is documented in
 source .venv/bin/activate
 pytest
 ```
+
+No IPFS daemon is needed; the suite stubs IPFS and runs every station path inside a temp directory. Three liboqs interop tests skip unless the `oqs` binding is installed.
 
 ## Protocol Specification
 
