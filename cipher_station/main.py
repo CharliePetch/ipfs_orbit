@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import json
 import hashlib
 import logging
+import threading
 import time
 
 from cipher_station.config import ensure_directories, MAX_UPLOAD_SIZE, CORS_ORIGINS
@@ -369,17 +370,32 @@ def get_content(cid: str, request: Request, delegate=Depends(require_owner)):
 #   2. FETCH_ENABLED        — operators who don't want their station
 #                             fetching third-party content can turn the
 #                             whole route into a 404 with one env var.
-#   3. FETCH_MAX_BYTES      — object size is checked (object/stat) BEFORE
-#                             any blocks are pulled; oversized CIDs are
-#                             refused with 413 and never touch the store.
+#   3. FETCH_MAX_BYTES      — object size is checked (files/stat) BEFORE
+#                             any content blocks are pulled; oversized CIDs
+#                             are refused with 413 and never touch the store.
 #   4. FETCH_PIN=false      — fetched blocks land as CACHE, not pins; the
 #                             next `repo gc` reclaims them. Nothing a
 #                             delegate fetches can silently grow the
 #                             permanent footprint unless the operator
-#                             opts in to pinning.
-#   5. FETCH_TIMEOUT        — a dead/unroutable CID costs one bounded DHT
-#                             walk, not a worker pinned forever.
+#                             opts in to pinning. When they do, the pin is
+#                             taken AFTER the full stream has been delivered
+#                             (blocks are local by then, so it is cheap) —
+#                             never before the first byte.
+#   5. FETCH_TIMEOUT        — a dead/unroutable CID costs one bounded wait
+#                             at the size gate (no retries: "nobody provides
+#                             this" is not transient), not a worker pinned
+#                             forever.
+#   6. FETCH_MAX_CONCURRENT — this route is synchronous, so every in-flight
+#                             fetch occupies a threadpool worker for its DHT
+#                             walk + stream. A bounded semaphore caps that;
+#                             beyond it the answer is 503 + Retry-After, so a
+#                             burst of slow fetches cannot starve /post,
+#                             /rewrap and friends of workers.
 # ---------------------------------------------------------
+from cipher_station.config import FETCH_MAX_CONCURRENT as _FETCH_MAX_CONCURRENT
+_fetch_slots = threading.BoundedSemaphore(_FETCH_MAX_CONCURRENT)
+
+
 @app.get("/fetch/{cid}")
 def fetch_content(cid: str, request: Request, delegate=Depends(require_owner)):
     from cipher_station.config import (
@@ -391,8 +407,10 @@ def fetch_content(cid: str, request: Request, delegate=Depends(require_owner)):
     from cipher_station.ipfs_client import (
         CONTENT_CHUNK_SIZE,
         IPFSError,
+        IPFSUnavailable,
         ipfs_object_stat,
         ipfs_open_network_stream,
+        ipfs_pin_add,
         is_plausible_cid,
     )
     from starlette.responses import StreamingResponse
@@ -403,48 +421,52 @@ def fetch_content(cid: str, request: Request, delegate=Depends(require_owner)):
     if not is_plausible_cid(cid):
         raise HTTPException(status_code=400, detail="not a CID")
 
-    # Size gate before any bytes move. object/stat resolves the DAG root and
-    # reads CumulativeSize without transferring content blocks.
-    try:
-        stat = ipfs_object_stat(cid)
-        total = int(stat.get("CumulativeSize", 0))
-    except Exception:
-        # Unresolvable within the API timeout — treat as not found rather
-        # than hanging the request further.
-        raise HTTPException(status_code=404, detail="CID not resolvable")
-
-    if total > FETCH_MAX_BYTES:
-        logger.info("GET /fetch/%s refused: %d bytes exceeds cap %d", cid, total, FETCH_MAX_BYTES)
-        raise HTTPException(status_code=413, detail="object exceeds fetch size cap")
-
-    try:
-        upstream = ipfs_open_network_stream(
-            cid,
-            range_header=request.headers.get("range"),
-            timeout=FETCH_TIMEOUT,
+    # Take a worker slot before touching the network. Released on every exit
+    # path below; on success, by the streaming generator's finally.
+    if not _fetch_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail="too many fetches in flight",
+            headers={"Retry-After": "5"},
         )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="not a CID")
-    except IPFSError as exc:
-        logger.warning("GET /fetch/%s: %s", cid, exc)
-        raise HTTPException(status_code=504, detail="content not retrievable")
 
-    if upstream.status_code == 416:
-        upstream.close()
-        raise HTTPException(status_code=416, detail="requested range not satisfiable")
-
-    if FETCH_PIN:
-        # Best-effort; the stream is the product, the pin is a bonus.
+    try:
+        # Size gate before any content bytes move. files/stat resolves the
+        # DAG root (one block) and reads CumulativeSize from it.
         try:
-            import requests as _requests
-            from cipher_station.config import IPFS_API
-            _requests.post(
-                f"{IPFS_API}/api/v0/pin/add",
-                params={"arg": cid},
+            stat = ipfs_object_stat(cid, timeout=FETCH_TIMEOUT, retry=False)
+            total = int(stat.get("CumulativeSize", 0))
+        except IPFSUnavailable as exc:
+            logger.error("GET /fetch/%s: IPFS daemon unreachable: %s", cid, exc)
+            raise HTTPException(status_code=503, detail="IPFS daemon unavailable")
+        except Exception as exc:
+            # Unresolvable within FETCH_TIMEOUT (or a malformed stat reply):
+            # nobody we can reach provides this root. Not found, not a hang.
+            logger.info("GET /fetch/%s: not resolvable: %s", cid, exc)
+            raise HTTPException(status_code=404, detail="CID not resolvable")
+
+        if total > FETCH_MAX_BYTES:
+            logger.info("GET /fetch/%s refused: %d bytes exceeds cap %d", cid, total, FETCH_MAX_BYTES)
+            raise HTTPException(status_code=413, detail="object exceeds fetch size cap")
+
+        try:
+            upstream = ipfs_open_network_stream(
+                cid,
+                range_header=request.headers.get("range"),
                 timeout=FETCH_TIMEOUT,
             )
-        except Exception as exc:
-            logger.warning("GET /fetch/%s: pin failed (continuing): %s", cid, exc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="not a CID")
+        except IPFSError as exc:
+            logger.warning("GET /fetch/%s: %s", cid, exc)
+            raise HTTPException(status_code=504, detail="content not retrievable")
+
+        if upstream.status_code == 416:
+            upstream.close()
+            raise HTTPException(status_code=416, detail="requested range not satisfiable")
+    except BaseException:
+        _fetch_slots.release()
+        raise
 
     headers = {"Accept-Ranges": "bytes"}
     for header in ("Content-Length", "Content-Range", "ETag"):
@@ -452,13 +474,28 @@ def fetch_content(cid: str, request: Request, delegate=Depends(require_owner)):
         if value:
             headers[header] = value
 
+    # Only a complete, un-ranged transfer leaves every block local; pinning
+    # after a partial read would kick off a second fetch for the remainder.
+    pin_after = FETCH_PIN and upstream.status_code == 200
+
     def stream():
+        completed = False
         try:
             for chunk in upstream.iter_content(chunk_size=CONTENT_CHUNK_SIZE):
                 if chunk:
                     yield chunk
+            completed = True
         finally:
             upstream.close()
+            try:
+                if pin_after and completed:
+                    # Best-effort; the stream was the product, the pin is a bonus.
+                    try:
+                        ipfs_pin_add(cid, timeout=FETCH_TIMEOUT)
+                    except Exception as exc:
+                        logger.warning("GET /fetch/%s: pin failed: %s", cid, exc)
+            finally:
+                _fetch_slots.release()
 
     return StreamingResponse(
         stream(),

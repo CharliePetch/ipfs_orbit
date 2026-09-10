@@ -22,6 +22,10 @@ class IPFSError(Exception):
     pass
 
 
+class IPFSUnavailable(IPFSError):
+    """The local IPFS daemon could not be reached at all (connection refused)."""
+
+
 class IPFSNotLocal(IPFSError):
     """
     The requested CID is not in this node's local blockstore.
@@ -154,7 +158,7 @@ def ipfs_repo_stat() -> dict:
     return _with_retry(_post)
 
 
-def ipfs_object_stat(cid: str) -> dict:
+def ipfs_object_stat(cid: str, *, timeout: int | None = None, retry: bool = True) -> dict:
     """
     Get stats for an individual IPFS object.
     Returns {"Hash": str, "CumulativeSize": int, "Size": int, ...}.
@@ -164,20 +168,51 @@ def ipfs_object_stat(cid: str) -> dict:
     /api/v0/object/stat endpoint was REMOVED in kubo 0.28
     ("removed, use 'ipfs dag' or 'ipfs files' instead"), and files/stat
     returns the same CumulativeSize while working on both old and new kubo.
-    NOTE: on a CID the node does not hold, this call resolves over the
-    network within IPFS_TIMEOUT — callers using it as a pre-fetch size gate
-    get resolution "for free" as part of the check.
+
+    On a CID the node does not hold, this call resolves the root block over
+    the network, bounded by `timeout` (default IPFS_TIMEOUT). Callers using
+    it as a pre-fetch size gate get resolution "for free" as part of the
+    check — and should pass ``retry=False``: a CID that nobody provides is
+    not a transient error, and retrying it three times with backoff would
+    turn one bounded wait into several.
+
+    Raises IPFSUnavailable when the daemon itself is unreachable, IPFSError
+    for everything else.
     """
     def _post():
         r = requests.post(
             f"{IPFS_API}/api/v0/files/stat",
             params={"arg": f"/ipfs/{quote(cid, safe='')}"},
-            timeout=IPFS_TIMEOUT,
+            timeout=timeout or IPFS_TIMEOUT,
         )
         r.raise_for_status()
         return r.json()
 
-    return _with_retry(_post)
+    if retry:
+        return _with_retry(_post)
+
+    try:
+        return _post()
+    except requests.exceptions.ConnectionError as exc:
+        raise IPFSUnavailable(f"IPFS daemon unreachable: {exc}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise IPFSError(f"IPFS stat failed for {cid}: {exc}") from exc
+
+
+def ipfs_pin_add(cid: str, *, timeout: int | None = None) -> None:
+    """
+    Pin `cid` recursively on the local node. Raises IPFSError on failure.
+    Fast when the blocks are already local (e.g. right after a full fetch).
+    """
+    try:
+        r = requests.post(
+            f"{IPFS_API}/api/v0/pin/add",
+            params={"arg": cid},
+            timeout=timeout or IPFS_TIMEOUT,
+        )
+        r.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise IPFSError(f"pin add failed for {cid}: {exc}") from exc
 
 
 def ipfs_get_bytes(cid: str) -> bytes:
