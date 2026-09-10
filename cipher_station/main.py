@@ -34,7 +34,6 @@ from cipher_station.rewrap_envelopes import rewrap_all_posts
 from cipher_station.pairing import create_pairing_session, confirm_pairing_session, PairingThrottled
 from cipher_station.auth import require_delegate, require_owner
 from cipher_station.tunnel import start_tunnel_monitor
-from cipher_station.panel import panel_router
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +64,9 @@ class RewrapMessage(BaseModel):
 
 app = FastAPI(title="Cipher Station Node", version="1.0.0")
 
-# Localhost-only admin panel (see cipher_station/panel/): /admin + /admin/api.
-# Guarded per-request by the actual socket peer address, not headers.
-app.include_router(panel_router)
+# NOTE: the admin panel is intentionally NOT mounted here. It runs on its own
+# 127.0.0.1-only listener (cipher_station/panel/app.py, default port 8444) so
+# that cloudflared / reverse proxies targeting this app can never reach it.
 
 # --------------------------------------------
 # CORS

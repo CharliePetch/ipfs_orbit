@@ -1,10 +1,18 @@
 # cipher_station/panel/router.py
 """
-Admin panel routes, mounted in main.py under /admin.
+Admin panel routes, served ONLY by the dedicated loopback panel app
+(cipher_station/panel/app.py) — never mounted on the main :8443 station app.
 
-Every route — page, static assets, and API — carries the localhost-only guard
-(guard.require_localhost) as a router-level dependency. None of them use the
-x-cipher-* signed-header auth: the trust boundary is the loopback socket.
+Two routers:
+
+- ``panel_router``: the HTML shell + static assets. Localhost-guarded only —
+  they contain no secrets, and the SPA needs to load before it can ask the
+  operator for the token.
+- ``panel_api``: every /admin/api route. Localhost guard PLUS the per-boot
+  bearer token (guard.require_panel_token, constant-time compare).
+
+None of them use the x-cipher-* signed-header auth: the trust boundary is the
+dedicated 127.0.0.1 listener plus the panel token.
 """
 
 import logging
@@ -14,18 +22,24 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from starlette.responses import FileResponse, Response
 
+from cipher_station import config as cfg
 from cipher_station.panel import drive, service
-from cipher_station.panel.guard import require_localhost
+from cipher_station.panel.guard import require_localhost, require_panel_token
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 panel_router = APIRouter(prefix="/admin", dependencies=[Depends(require_localhost)])
+panel_api = APIRouter(
+    prefix="/admin/api",
+    dependencies=[Depends(require_localhost), Depends(require_panel_token)],
+)
 
 
 # ---------------------------------------------------------------------------
-# Page + static assets
+# Page + static assets (no token: no secrets, and the SPA must be able to
+# render its token prompt)
 # ---------------------------------------------------------------------------
 
 @panel_router.get("", include_in_schema=False)
@@ -47,12 +61,12 @@ def panel_static(filename: str):
 # Status + configuration API
 # ---------------------------------------------------------------------------
 
-@panel_router.get("/api/status")
+@panel_api.get("/status")
 def api_status():
     return service.get_status()
 
 
-@panel_router.get("/api/config")
+@panel_api.get("/config")
 def api_get_config():
     return service.get_config()
 
@@ -64,7 +78,7 @@ class ConfigUpdate(BaseModel):
     clear_permanent_url: bool = False
 
 
-@panel_router.post("/api/config")
+@panel_api.post("/config")
 def api_update_config(req: ConfigUpdate):
     provided = req.model_dump(exclude_unset=True)
     result: dict = {"status": "ok", "restart_required": False}
@@ -89,7 +103,7 @@ class StorageMaxUpdate(BaseModel):
     storage_max: str
 
 
-@panel_router.post("/api/config/storage-max")
+@panel_api.post("/config/storage-max")
 def api_set_storage_max(req: StorageMaxUpdate):
     try:
         service.set_storage_max(req.storage_max)
@@ -113,7 +127,7 @@ class ProfileUpdate(BaseModel):
     link: str | None = None
 
 
-@panel_router.post("/api/profile")
+@panel_api.post("/profile")
 def api_update_profile(req: ProfileUpdate):
     from cipher_station.profile import update_profile_fields
     provided = req.model_dump(exclude_unset=True)
@@ -128,7 +142,23 @@ def api_update_profile(req: ProfileUpdate):
 # Drive API
 # ---------------------------------------------------------------------------
 
-@panel_router.get("/api/drive/files")
+# Decrypted private content: types that may render inline. Under the
+# CSP "default-src 'none'; sandbox" + nosniff headers below they cannot run
+# script; everything else ships as an application/octet-stream attachment.
+_INLINE_MIME_PREFIXES = ("image/", "video/", "audio/")
+_INLINE_MIME_EXACT = {"application/pdf", "text/plain"}
+
+
+def _content_security_headers() -> dict:
+    return {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        # Keep decrypted content out of shared caches.
+        "Cache-Control": "no-store",
+    }
+
+
+@panel_api.get("/drive/files")
 def api_drive_files():
     try:
         return drive.list_files()
@@ -137,7 +167,7 @@ def api_drive_files():
         raise HTTPException(status_code=503, detail=f"drive unavailable: {e}")
 
 
-@panel_router.get("/api/drive/file/{post_cid}")
+@panel_api.get("/drive/file/{post_cid}")
 def api_drive_file(post_cid: str, download: bool = False):
     try:
         plaintext, meta = drive.open_file(post_cid)
@@ -150,25 +180,44 @@ def api_drive_file(post_cid: str, download: bool = False):
         raise HTTPException(status_code=503, detail=f"drive unavailable: {e}")
 
     filename = meta.get("filename") or post_cid
-    disposition = "attachment" if download else "inline"
+    mime = drive.guess_mime(meta)
+    inline_ok = mime.startswith(_INLINE_MIME_PREFIXES) or mime in _INLINE_MIME_EXACT
+    if not inline_ok:
+        # Non-media types never render in the browser: opaque download only.
+        mime = "application/octet-stream"
+    disposition = "inline" if (inline_ok and not download) else "attachment"
     safe_name = str(filename).replace('"', "")
-    return Response(
-        content=plaintext,
-        media_type=drive.guess_mime(meta),
-        headers={
-            "Content-Disposition": f'{disposition}; filename="{safe_name}"',
-            # Decrypted private content: keep it out of shared caches.
-            "Cache-Control": "no-store",
-        },
-    )
+    headers = _content_security_headers()
+    headers["Content-Disposition"] = f'{disposition}; filename="{safe_name}"'
+    return Response(content=plaintext, media_type=mime, headers=headers)
 
 
-@panel_router.post("/api/drive/upload")
+_UPLOAD_CHUNK = 1024 * 1024
+
+
+@panel_api.post("/drive/upload")
 def api_drive_upload(
     file: UploadFile = File(...),
     folder: str = Form(None),
 ):
-    file_bytes = file.file.read()
+    # Stream from the (disk-spooled) upload and abort at the cap — never
+    # buffer an unbounded body in memory. app.py also rejects oversized
+    # Content-Length before the body is read at all.
+    limit = cfg.MAX_UPLOAD_SIZE
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = file.file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"upload too large (max {limit} bytes)",
+            )
+        chunks.append(chunk)
+    file_bytes = b"".join(chunks)
     if not file_bytes:
         raise HTTPException(status_code=400, detail="empty file")
     try:
@@ -184,7 +233,7 @@ class DriveDelete(BaseModel):
     post_cid: str
 
 
-@panel_router.post("/api/drive/delete")
+@panel_api.post("/drive/delete")
 def api_drive_delete(req: DriveDelete):
     try:
         return drive.delete_file(req.post_cid)
