@@ -22,6 +22,10 @@ class IPFSError(Exception):
     pass
 
 
+class IPFSUnavailable(IPFSError):
+    """The local IPFS daemon could not be reached at all (connection refused)."""
+
+
 class IPFSNotLocal(IPFSError):
     """
     The requested CID is not in this node's local blockstore.
@@ -154,22 +158,61 @@ def ipfs_repo_stat() -> dict:
     return _with_retry(_post)
 
 
-def ipfs_object_stat(cid: str) -> dict:
+def ipfs_object_stat(cid: str, *, timeout: int | None = None, retry: bool = True) -> dict:
     """
     Get stats for an individual IPFS object.
-    Returns {"Hash": str, "CumulativeSize": int, "DataSize": int, ...}.
+    Returns {"Hash": str, "CumulativeSize": int, "Size": int, ...}.
     CumulativeSize is the total size including linked objects.
+
+    Uses /api/v0/files/stat with an /ipfs/ path: the older
+    /api/v0/object/stat endpoint was REMOVED in kubo 0.28
+    ("removed, use 'ipfs dag' or 'ipfs files' instead"), and files/stat
+    returns the same CumulativeSize while working on both old and new kubo.
+
+    On a CID the node does not hold, this call resolves the root block over
+    the network, bounded by `timeout` (default IPFS_TIMEOUT). Callers using
+    it as a pre-fetch size gate get resolution "for free" as part of the
+    check — and should pass ``retry=False``: a CID that nobody provides is
+    not a transient error, and retrying it three times with backoff would
+    turn one bounded wait into several.
+
+    Raises IPFSUnavailable when the daemon itself is unreachable, IPFSError
+    for everything else.
     """
     def _post():
         r = requests.post(
-            f"{IPFS_API}/api/v0/object/stat",
-            params={"arg": cid},
-            timeout=IPFS_TIMEOUT,
+            f"{IPFS_API}/api/v0/files/stat",
+            params={"arg": f"/ipfs/{quote(cid, safe='')}"},
+            timeout=timeout or IPFS_TIMEOUT,
         )
         r.raise_for_status()
         return r.json()
 
-    return _with_retry(_post)
+    if retry:
+        return _with_retry(_post)
+
+    try:
+        return _post()
+    except requests.exceptions.ConnectionError as exc:
+        raise IPFSUnavailable(f"IPFS daemon unreachable: {exc}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise IPFSError(f"IPFS stat failed for {cid}: {exc}") from exc
+
+
+def ipfs_pin_add(cid: str, *, timeout: int | None = None) -> None:
+    """
+    Pin `cid` recursively on the local node. Raises IPFSError on failure.
+    Fast when the blocks are already local (e.g. right after a full fetch).
+    """
+    try:
+        r = requests.post(
+            f"{IPFS_API}/api/v0/pin/add",
+            params={"arg": cid},
+            timeout=timeout or IPFS_TIMEOUT,
+        )
+        r.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise IPFSError(f"pin add failed for {cid}: {exc}") from exc
 
 
 def ipfs_get_bytes(cid: str) -> bytes:
@@ -292,6 +335,72 @@ def ipfs_open_local_stream(cid: str, *, range_header: str | None = None):
         raise IPFSNotLocal(f"CID not available locally: {cid} (gateway {status})")
 
     raise IPFSError(f"local IPFS gateway returned {status} for {cid}")
+
+
+# ---------------------------------------------------------------------------
+# Network streaming read (backs GET /fetch/{cid})
+# ---------------------------------------------------------------------------
+
+def ipfs_open_network_stream(
+    cid: str,
+    *,
+    range_header: str | None = None,
+    timeout: int | None = None,
+):
+    """
+    Open a STREAMING read of `cid` from this node's own HTTP gateway, ALLOWING
+    a network fetch (bitswap/DHT) when the blocks are not already local.
+
+    This is the deliberate inverse of ``ipfs_open_local_stream``: no
+    ``only-if-cached`` header, so kubo will resolve providers and pull blocks
+    through this node's own peer connections — which is precisely the point.
+    A delegate on a flaky/rate-limited path to the public gateways asks its own
+    station instead; the station fetches over libp2p and streams the bytes
+    down the (authenticated, TLS) station connection.
+
+    The blast-radius controls live in the ROUTE, not here (auth, size cap,
+    enable flag); this function only knows how to move bytes. `timeout`
+    bounds the wait for the response HEADERS (DHT walk + first byte); once
+    streaming has begun, the read is governed by the caller draining
+    ``iter_content``.
+
+    Returns the open ``requests.Response`` — 200, 206 for a satisfied Range,
+    or 416 for an unsatisfiable one. THE CALLER OWNS IT and MUST call
+    ``.close()`` — iterate ``.iter_content()`` inside a try/finally.
+
+    Raises:
+        ValueError — `cid` is not syntactically a CID (never sent anywhere).
+        IPFSError  — the gateway is unreachable, the fetch timed out, or the
+                     gateway answered unexpectedly (unroutable CID, 5xx…).
+    """
+    if not is_plausible_cid(cid):
+        raise ValueError(f"not a CID: {cid!r}")
+
+    headers = {"Accept-Encoding": "identity"}
+    if range_header and is_valid_range_header(range_header):
+        headers["Range"] = range_header
+
+    url = f"{IPFS_GATEWAY}/ipfs/{quote(cid, safe='')}"
+
+    try:
+        resp = requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=timeout or IPFS_TIMEOUT,
+            allow_redirects=False,
+        )
+    except requests.exceptions.Timeout as exc:
+        raise IPFSError(f"network fetch timed out for {cid}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise IPFSError(f"local IPFS gateway unreachable: {exc}") from exc
+
+    if resp.status_code in (200, 206, 416):
+        return resp
+
+    status = resp.status_code
+    resp.close()
+    raise IPFSError(f"gateway returned {status} for network fetch of {cid}")
 
 
 # ---------------------------------------------------------------------------
