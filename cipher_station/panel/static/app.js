@@ -2,8 +2,27 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+
+/* ---------------- per-boot token auth ---------------- */
+let TOKEN = sessionStorage.getItem("panel_token") || "";
+
+function showLogin(message) {
+  $("login-err").textContent = message || "";
+  $("login").classList.remove("hidden");
+  $("login-token").focus();
+}
+
+function authHeaders(extra = {}) {
+  return Object.assign({ "Authorization": "Bearer " + TOKEN }, extra);
+}
+
 const api = async (path, opts = {}) => {
+  opts.headers = authHeaders(opts.headers || {});
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    showLogin(TOKEN ? "Token rejected — the station may have restarted." : "");
+    throw new Error("panel token required");
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch (_) {}
@@ -11,6 +30,30 @@ const api = async (path, opts = {}) => {
   }
   return res.json();
 };
+
+/* Authenticated binary fetch → object URL (img/video/iframe src and download
+   links cannot carry the Authorization header themselves). */
+async function fetchBlobUrl(path) {
+  const res = await fetch(path, { headers: authHeaders() });
+  if (res.status === 401) { showLogin(); throw new Error("panel token required"); }
+  if (!res.ok) throw new Error(res.statusText);
+  return URL.createObjectURL(await res.blob());
+}
+
+$("login-go").addEventListener("click", () => {
+  const t = $("login-token").value.trim();
+  if (!t) return;
+  TOKEN = t;
+  sessionStorage.setItem("panel_token", t);
+  $("login").classList.add("hidden");
+  $("login-token").value = "";
+  cfgLoaded = false;
+  driveState.loaded = false;
+  loadDashboard();
+});
+$("login-token").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("login-go").click();
+});
 
 function toast(text, danger = false) {
   const el = $("toast");
@@ -65,7 +108,6 @@ function fmtDate(ts) {
 }
 
 /* ---------------- dashboard ---------------- */
-let pinTimer = null;
 
 async function loadDashboard() {
   try {
@@ -92,8 +134,6 @@ async function loadDashboard() {
     } else {
       $("d-ipfs-used").textContent = ipfs.error ? "unavailable" : "—";
     }
-
-    renderPins(s.pairing_pins || []);
   } catch (err) {
     $("dash-loading").classList.add("hidden");
     $("dash-body").classList.add("hidden");
@@ -101,53 +141,6 @@ async function loadDashboard() {
     el.textContent = "Could not load station status: " + err.message;
     el.classList.remove("hidden");
   }
-}
-
-function renderPins(pins) {
-  const box = $("d-pins");
-  box.innerHTML = "";
-  if (!pins.length) {
-    const p = document.createElement("div");
-    p.className = "hint";
-    p.textContent = "No recent PINs.";
-    box.appendChild(p);
-    return;
-  }
-  const now = Date.now() / 1000;
-  pins.forEach((pin) => {
-    const row = document.createElement("div");
-    row.className = "pin-row";
-    const code = document.createElement("span");
-    code.className = "pin-code mono";
-    code.textContent = pin.pin;
-    code.title = "Click to copy";
-    code.addEventListener("click", () => copyText(pin.pin));
-    const exp = document.createElement("span");
-    exp.className = "pin-exp";
-    if (pin.created_at != null) {
-      const expiresAt = pin.created_at + 300;
-      const tick = () => {
-        const left = Math.floor(expiresAt - Date.now() / 1000);
-        if (left > 0) {
-          exp.textContent = `expires in ${Math.floor(left / 60)}m${String(left % 60).padStart(2, "0")}s`;
-          exp.classList.remove("expired");
-        } else {
-          exp.textContent = "expired";
-          exp.classList.add("expired");
-        }
-      };
-      tick();
-      row._tick = tick;
-    } else {
-      exp.textContent = "";
-    }
-    row.append(code, exp);
-    box.appendChild(row);
-  });
-  clearInterval(pinTimer);
-  pinTimer = setInterval(() => {
-    box.querySelectorAll(".pin-row").forEach((r) => r._tick && r._tick());
-  }, 1000);
 }
 
 loadDashboard();
@@ -338,10 +331,10 @@ function fileRow(f) {
 
   const actions = document.createElement("td");
   actions.className = "file-actions";
-  const dl = document.createElement("a");
+  const dl = document.createElement("button");
   dl.className = "btn";
   dl.textContent = "Download";
-  dl.href = `/admin/api/drive/file/${encodeURIComponent(f.post_cid)}?download=true`;
+  dl.addEventListener("click", () => downloadFile(f));
   const del = document.createElement("button");
   del.className = "btn danger-btn";
   del.textContent = "Delete";
@@ -352,41 +345,65 @@ function fileRow(f) {
   return tr;
 }
 
-function previewFile(f) {
+async function downloadFile(f) {
+  try {
+    const blobUrl = await fetchBlobUrl(
+      `/admin/api/drive/file/${encodeURIComponent(f.post_cid)}?download=true`);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = f.filename || "file";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+  } catch (err) {
+    toast("Download failed: " + err.message, true);
+  }
+}
+
+async function previewFile(f) {
   const url = `/admin/api/drive/file/${encodeURIComponent(f.post_cid)}`;
   const mime = f.mime_type || "";
   const body = $("pv-body");
   body.innerHTML = "";
   $("pv-name").textContent = f.filename;
-  $("pv-download").href = url + "?download=true";
+  $("pv-download").onclick = (e) => { e.preventDefault(); downloadFile(f); };
+  $("pv-download").href = "#";
 
-  if (mime.startsWith("image/")) {
-    const img = document.createElement("img");
-    img.src = url; img.alt = f.filename;
-    body.appendChild(img);
-  } else if (mime.startsWith("video/")) {
-    const v = document.createElement("video");
-    v.src = url; v.controls = true;
-    body.appendChild(v);
-  } else if (mime.startsWith("audio/")) {
-    const a = document.createElement("audio");
-    a.src = url; a.controls = true;
-    body.appendChild(a);
-  } else if (mime === "application/pdf") {
-    const fr = document.createElement("iframe");
-    fr.src = url;
-    body.appendChild(fr);
-  } else if (mime.startsWith("text/") || mime === "application/json") {
-    const pre = document.createElement("pre");
-    pre.textContent = "Loading…";
-    body.appendChild(pre);
-    fetch(url).then((r) => r.text()).then((t) => {
-      pre.textContent = t.length > 200000 ? t.slice(0, 200000) + "\n… (truncated)" : t;
-    }).catch((e) => { pre.textContent = "Could not load file: " + e.message; });
-  } else {
+  try {
+    if (mime.startsWith("image/")) {
+      const img = document.createElement("img");
+      img.src = await fetchBlobUrl(url); img.alt = f.filename;
+      body.appendChild(img);
+    } else if (mime.startsWith("video/")) {
+      const v = document.createElement("video");
+      v.src = await fetchBlobUrl(url); v.controls = true;
+      body.appendChild(v);
+    } else if (mime.startsWith("audio/")) {
+      const a = document.createElement("audio");
+      a.src = await fetchBlobUrl(url); a.controls = true;
+      body.appendChild(a);
+    } else if (mime === "application/pdf") {
+      const fr = document.createElement("iframe");
+      fr.src = await fetchBlobUrl(url);
+      body.appendChild(fr);
+    } else if (mime.startsWith("text/") || mime === "application/json") {
+      const pre = document.createElement("pre");
+      pre.textContent = "Loading…";
+      body.appendChild(pre);
+      fetch(url, { headers: authHeaders() }).then((r) => r.text()).then((t) => {
+        pre.textContent = t.length > 200000 ? t.slice(0, 200000) + "\n… (truncated)" : t;
+      }).catch((e) => { pre.textContent = "Could not load file: " + e.message; });
+    } else {
+      const p = document.createElement("div");
+      p.className = "state-block";
+      p.textContent = "No inline preview for this file type — use Download.";
+      body.appendChild(p);
+    }
+  } catch (err) {
     const p = document.createElement("div");
-    p.className = "state-block";
-    p.textContent = "No inline preview for this file type — use Download.";
+    p.className = "state-block danger";
+    p.textContent = "Could not load preview: " + err.message;
     body.appendChild(p);
   }
   $("preview").classList.remove("hidden");

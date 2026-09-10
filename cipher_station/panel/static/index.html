@@ -52,11 +52,6 @@
         <div class="kv"><span>Used</span><span id="d-ipfs-used">—</span></div>
         <div class="meter"><div id="d-ipfs-meter" class="meter-fill"></div></div>
       </div>
-      <div class="card">
-        <div class="label">Pairing PINs</div>
-        <div id="d-pins"></div>
-        <p class="hint">PINs are generated when a device calls <span class="mono">/delegate/start</span>. Each expires 5 minutes after creation.</p>
-      </div>
     </div>
   </div>
 </section>
@@ -170,6 +165,26 @@
       <div class="row-end">
         <button id="fd-cancel" class="btn">Cancel</button>
         <button id="fd-go" class="btn primary">Upload</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Token login overlay -->
+<div id="login" class="overlay hidden">
+  <div class="overlay-inner narrow">
+    <div class="overlay-head"><strong>Panel access token</strong></div>
+    <div class="overlay-body pad">
+      <p class="hint">This panel requires the station's per-boot access token.
+      On the station, read it with:</p>
+      <p><code class="mono copyable" title="Click to copy">cat &lt;data_dir&gt;/panel_token</code></p>
+      <p class="hint">(default: <span class="mono">cipher_station_data/panel_token</span>;
+      a new token is generated each time the station starts.)</p>
+      <div class="field"><label for="login-token">Token</label>
+        <input id="login-token" type="password" autocomplete="off" placeholder="paste token"></div>
+      <div id="login-err" class="msg err"></div>
+      <div class="row-end">
+        <button id="login-go" class="btn primary">Unlock</button>
       </div>
     </div>
   </div>

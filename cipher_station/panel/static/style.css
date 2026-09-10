@@ -105,13 +105,6 @@ body {
 }
 .meter-fill { height: 100%; width: 0; background: var(--accent); transition: width 300ms; }
 
-/* ---- pins ---- */
-.pin-row { display: flex; align-items: baseline; gap: 10px; padding: 4px 0; }
-.pin-code { font-weight: 700; letter-spacing: 0.15em; cursor: pointer; }
-.pin-code:hover { color: var(--accent); }
-.pin-exp { color: var(--muted); font-size: 0.82rem; }
-.pin-exp.expired { color: var(--danger); }
-
 /* ---- forms ---- */
 .field { margin-bottom: 12px; }
 .field label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; }
