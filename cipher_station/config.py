@@ -54,6 +54,12 @@ IPFS_GATEWAY = os.getenv("IPFS_GATEWAY_URL", "http://127.0.0.1:8080").rstrip("/"
 # ---------------------------------------------------------------------------
 CIPHER_PORT = int(os.getenv("CIPHER_PORT", "8443"))
 CIPHER_HOST = os.getenv("CIPHER_HOST", "0.0.0.0")
+
+# Admin panel: its own uvicorn listener, ALWAYS bound to 127.0.0.1 (plain
+# HTTP, no proxy-headers). Never exposed through the tunnel; remote access is
+# an SSH tunnel (ssh -L 8444:localhost:8444 user@station).
+CIPHER_PANEL_PORT = int(os.getenv("CIPHER_PANEL_PORT", "8444"))
+CIPHER_PANEL_HOST = "127.0.0.1"
 SSL_CERTFILE = os.getenv("SSL_CERTFILE", str(BASE_DIR / "ssl" / "cert.pem"))
 SSL_KEYFILE = os.getenv("SSL_KEYFILE", str(BASE_DIR / "ssl" / "key.pem"))
 
