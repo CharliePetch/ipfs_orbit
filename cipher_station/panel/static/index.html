@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cipher Station — Admin</title>
+<link rel="stylesheet" href="/admin/static/style.css">
+<link rel="icon" href="/admin/static/cipher-mark-filled.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <circle cx="16" cy="16" r="4.2"/>
+        <ellipse cx="16" cy="16" rx="13" ry="6" transform="rotate(-30 16 16)"/>
+      </svg>
+    </span>
+    <span class="wordmark">cipher <span class="wordmark-sub">station</span></span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="config">Configuration</button>
+    <button class="tab" data-tab="drive">Drive</button>
+  </nav>
+</header>
+
+<main class="content">
+
+<!-- ======================= DASHBOARD ======================= -->
+<section id="tab-dashboard" class="tab-panel">
+  <div id="dash-loading" class="state-block">Loading station status…</div>
+  <div id="dash-error" class="state-block danger hidden"></div>
+  <div id="dash-body" class="hidden">
+    <div class="grid">
+      <div class="card">
+        <div class="label">Station</div>
+        <div class="kv"><span>Status</span><strong id="d-status">—</strong></div>
+        <div class="kv"><span>Version</span><span id="d-version" class="mono">—</span></div>
+        <div class="kv"><span>Uptime</span><span id="d-uptime">—</span></div>
+        <div class="kv"><span>UID</span><span id="d-uid" class="mono copyable" title="Click to copy">—</span></div>
+      </div>
+      <div class="card">
+        <div class="label">Network</div>
+        <div class="kv"><span>Public URL</span><span id="d-endpoint" class="mono copyable" title="Click to copy">—</span></div>
+        <div class="kv"><span>Peer ID</span><span id="d-peer" class="mono copyable" title="Click to copy">—</span></div>
+        <div class="kv"><span>IPNS name</span><span id="d-ipns" class="mono copyable" title="Click to copy">—</span></div>
+      </div>
+      <div class="card">
+        <div class="label">IPFS storage</div>
+        <div class="kv"><span>Daemon</span><strong id="d-ipfs-status">—</strong></div>
+        <div class="kv"><span>Used</span><span id="d-ipfs-used">—</span></div>
+        <div class="meter"><div id="d-ipfs-meter" class="meter-fill"></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= CONFIG ======================= -->
+<section id="tab-config" class="tab-panel hidden">
+  <div id="cfg-loading" class="state-block">Loading configuration…</div>
+  <div id="cfg-error" class="state-block danger hidden"></div>
+  <div id="cfg-body" class="hidden">
+    <div class="card">
+      <div class="label">Station name &amp; profile</div>
+      <div class="field"><label for="c-alias">Station name (alias)</label>
+        <input id="c-alias" type="text" maxlength="80" placeholder="My Station"></div>
+      <div class="field"><label for="c-display">Display name</label>
+        <input id="c-display" type="text" maxlength="80"></div>
+      <div class="field"><label for="c-username">Username</label>
+        <input id="c-username" type="text" maxlength="30" placeholder="letters, digits, . _"></div>
+      <div class="field"><label for="c-bio">Bio</label>
+        <textarea id="c-bio" maxlength="300" rows="2"></textarea></div>
+      <div class="field"><label for="c-link">Link</label>
+        <input id="c-link" type="url" placeholder="https://…"></div>
+      <button id="c-save-profile" class="btn primary">Save profile</button>
+      <span id="c-profile-msg" class="msg"></span>
+    </div>
+
+    <div class="card">
+      <div class="label">Permanent URL &amp; tunnel</div>
+      <p class="hint">The station advertises one public URL in <span class="mono">public.json</span> and over IPNS.
+      Use the Cloudflare quick tunnel (URL rotates on restart) or set a permanent URL
+      (named tunnel or your own domain/DNS pointing at this station).</p>
+      <div class="field checkbox">
+        <input id="c-tunnel" type="checkbox">
+        <label for="c-tunnel">Cloudflare quick tunnel enabled</label>
+      </div>
+      <div class="field"><label for="c-permurl">Permanent public URL (overrides quick tunnel)</label>
+        <input id="c-permurl" type="url" placeholder="https://station.example.com"></div>
+      <button id="c-save-net" class="btn primary">Save network settings</button>
+      <span id="c-net-msg" class="msg"></span>
+      <div id="c-restart-note" class="restart-note hidden">
+        Changes take effect after a station restart. Run:
+        <code class="mono copyable" id="c-restart-cmd" title="Click to copy">sudo systemctl restart cipherstation</code>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="label">IPFS storage cap</div>
+      <p class="hint">Disk space dedicated to Cipher Station's IPFS repo
+      (<span class="mono">Datastore.StorageMax</span>). Examples: 10GB, 50GB, 500GB.</p>
+      <div class="field inline">
+        <input id="c-storage" type="text" placeholder="10GB">
+        <button id="c-save-storage" class="btn">Save cap</button>
+      </div>
+      <span id="c-storage-msg" class="msg"></span>
+      <div id="c-storage-restart" class="restart-note hidden">
+        The cap applies at garbage-collection time; restart the IPFS daemon to re-read it now:
+        <code class="mono copyable" title="Click to copy">sudo systemctl restart ipfs</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= DRIVE ======================= -->
+<section id="tab-drive" class="tab-panel hidden">
+  <div class="drive-toolbar">
+    <div id="dr-folders" class="chips"></div>
+    <div class="spacer"></div>
+    <label class="btn primary" for="dr-file-input">Upload files</label>
+    <input id="dr-file-input" type="file" multiple class="hidden">
+  </div>
+
+  <div id="dr-dropzone" class="dropzone">
+    <div id="dr-loading" class="state-block">Loading drive…</div>
+    <div id="dr-error" class="state-block danger hidden"></div>
+    <div id="dr-empty" class="state-block hidden">
+      <p><strong>Your drive is empty.</strong></p>
+      <p class="hint">Drag files here or use “Upload files”. Files are encrypted before they touch IPFS — the same drive CipherVault sees.</p>
+    </div>
+    <table id="dr-table" class="file-table hidden">
+      <thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Date</th><th></th></tr></thead>
+      <tbody id="dr-rows"></tbody>
+    </table>
+    <div id="dr-meta-errors" class="hint hidden"></div>
+  </div>
+
+  <div id="dr-uploads" class="uploads hidden"></div>
+</section>
+</main>
+
+<!-- Preview overlay -->
+<div id="preview" class="overlay hidden">
+  <div class="overlay-inner">
+    <div class="overlay-head">
+      <span id="pv-name" class="mono"></span>
+      <span class="spacer"></span>
+      <a id="pv-download" class="btn" download>Download</a>
+      <button id="pv-close" class="btn">Close</button>
+    </div>
+    <div id="pv-body" class="overlay-body"></div>
+  </div>
+</div>
+
+<!-- Upload folder dialog -->
+<div id="folder-dialog" class="overlay hidden">
+  <div class="overlay-inner narrow">
+    <div class="overlay-head"><strong>Upload to folder</strong></div>
+    <div class="overlay-body pad">
+      <p class="hint" id="fd-files"></p>
+      <div class="field"><label for="fd-folder">Folder (existing or new; empty = no folder)</label>
+        <input id="fd-folder" type="text" list="fd-folder-list" placeholder="Documents">
+        <datalist id="fd-folder-list"></datalist></div>
+      <div class="row-end">
+        <button id="fd-cancel" class="btn">Cancel</button>
+        <button id="fd-go" class="btn primary">Upload</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Token login overlay -->
+<div id="login" class="overlay hidden">
+  <div class="overlay-inner narrow">
+    <div class="overlay-head"><strong>Panel access token</strong></div>
+    <div class="overlay-body pad">
+      <p class="hint">This panel requires the station's per-boot access token.
+      On the station, read it with:</p>
+      <p><code class="mono copyable" title="Click to copy">cat &lt;data_dir&gt;/panel_token</code></p>
+      <p class="hint">(default: <span class="mono">cipher_station_data/panel_token</span>;
+      a new token is generated each time the station starts.)</p>
+      <div class="field"><label for="login-token">Token</label>
+        <input id="login-token" type="password" autocomplete="off" placeholder="paste token"></div>
+      <div id="login-err" class="msg err"></div>
+      <div class="row-end">
+        <button id="login-go" class="btn primary">Unlock</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/admin/static/app.js"></script>
+</body>
+</html>

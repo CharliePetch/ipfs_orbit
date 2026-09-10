@@ -99,6 +99,7 @@ Settings are read from the environment or a `.env` file in the project root (the
 |----------|---------|-------------|
 | `CIPHER_PORT` | `8443` | HTTPS port |
 | `CIPHER_HOST` | `0.0.0.0` | Bind address |
+| `CIPHER_PANEL_PORT` | `8444` | Admin panel port (always bound to 127.0.0.1; see [Admin panel](#admin-panel)) |
 | `CIPHER_BASE_DIR` | `./cipher_station_data` | Where keys, DB, manifests and TLS certs live |
 | `CIPHER_PASSWORD` | _(empty)_ | Encrypt the station's private keys at rest (Argon2i) |
 | `CIPHER_PQC_BACKEND` | `auto` | `auto` / `liboqs` / `python` — see [constant-time backend](#optional-constant-time-backend-liboqs) |
@@ -326,6 +327,41 @@ cipher-station/
 │   ├── cipherstation.db    # SQLite database
 │   └── ssl/                # TLS certificates
 └── tests/                  # Test suite
+```
+
+## Admin panel
+
+The station serves a web admin panel on its **own loopback-only listener**:
+**http://localhost:8444/admin** (`CIPHER_PANEL_PORT`, always bound to
+127.0.0.1, plain HTTP, no proxy-header trust). It is a separate server from
+the public :8443 API, so the Cloudflare tunnel and any reverse proxy of :8443
+can never reach it.
+
+Access requires the **per-boot panel token**: on every station start a random
+token is written (mode 0600) to `<data_dir>/panel_token`. Read it on the
+station:
+
+```bash
+cat cipher_station_data/panel_token
+```
+
+The panel prompts for the token and keeps it in sessionStorage; every
+`/admin/api` request must carry `Authorization: Bearer <token>` (constant-time
+compared). As defense in depth the panel also refuses non-loopback socket
+peers and rejects state-changing requests with a foreign `Origin` header.
+
+The panel shows live station status (public URL, peer ID, IPNS name, IPFS
+storage), lets you edit the station name/profile, tunnel & permanent-URL
+settings, and the IPFS storage cap, and includes a full drive client (browse,
+preview, upload, download, delete) compatible with the CipherVault drive
+format. Pairing PINs are intentionally **not** shown in the panel — read them
+from the station log on the box.
+
+From another machine, use an SSH tunnel:
+
+```bash
+ssh -L 8444:localhost:8444 user@station
+# then open http://localhost:8444/admin locally
 ```
 
 ## Managing Your Station

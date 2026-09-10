@@ -65,6 +65,10 @@ class RewrapMessage(BaseModel):
 
 app = FastAPI(title="Cipher Station Node", version="1.0.0")
 
+# NOTE: the admin panel is intentionally NOT mounted here. It runs on its own
+# 127.0.0.1-only listener (cipher_station/panel/app.py, default port 8444) so
+# that cloudflared / reverse proxies targeting this app can never reach it.
+
 # --------------------------------------------
 # CORS
 # --------------------------------------------
