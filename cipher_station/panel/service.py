@@ -26,14 +26,6 @@ logger = logging.getLogger(__name__)
 # Process start time — uptime of the station process (the panel runs inside it).
 _STARTED_AT = time.time()
 
-# Matches tray.py: log-derived pairing PIN surface.
-LOG_PATH_ENV = "CIPHER_LOG_FILE"
-PIN_LOOKBACK_SECONDS = 30 * 60
-PIN_TTL_SECONDS = 5 * 60          # matches pairing.TTL_SECONDS
-PINS_MAX = 8
-PIN_RE = re.compile(r"PAIRING PIN:\s*(\d{4,8})")
-LOG_TS_FMT = "%Y-%m-%d %H:%M:%S"  # matches config.py logging datefmt
-
 SIZE_RE = re.compile(r"(?i)^\s*\d+(\.\d+)?\s*[kmgt]?b\s*$")
 
 ENV_PATH = PROJECT_ROOT / ".env"
@@ -62,46 +54,6 @@ def _read_public_json() -> dict:
         return json.loads(cfg.PUBLIC_JSON_PATH.read_text())
     except Exception:
         return {}
-
-
-def read_recent_pins(now: float | None = None) -> list[dict]:
-    """Parse the station log for recent PAIRING PIN lines (same source the
-    macOS tray uses). Newest first, with expiry info for a live countdown."""
-    now = now if now is not None else time.time()
-    log_path = cfg.BASE_DIR / "logs" / "cipherstation.log"
-    env_override = os.getenv(LOG_PATH_ENV)
-    if env_override:
-        from pathlib import Path
-        log_path = Path(env_override)
-    if not log_path.exists():
-        return []
-    try:
-        data = log_path.read_bytes()[-200_000:]
-        text = data.decode("utf-8", errors="replace")
-    except Exception:
-        return []
-
-    pins = []
-    for line in text.splitlines():
-        m = PIN_RE.search(line)
-        if not m:
-            continue
-        ts = None
-        try:
-            ts = time.mktime(time.strptime(line[:19], LOG_TS_FMT))
-        except Exception:
-            ts = None
-        if ts is not None and (now - ts) > PIN_LOOKBACK_SECONDS:
-            continue
-        expires_in = int(PIN_TTL_SECONDS - (now - ts)) if ts is not None else None
-        pins.append({
-            "pin": m.group(1),
-            "created_at": int(ts) if ts is not None else None,
-            "expires_in_seconds": max(0, expires_in) if expires_in is not None else None,
-            "expired": (expires_in is not None and expires_in <= 0),
-        })
-    pins.reverse()
-    return pins[:PINS_MAX]
 
 
 def get_status() -> dict:
@@ -143,7 +95,9 @@ def get_status() -> dict:
         "manifest_pointer": pub.get("manifest_pointer"),
         "ipfs": ipfs,
         "profile": profile,
-        "pairing_pins": read_recent_pins(),
+        # NOTE: pairing PINs are deliberately NOT exposed here — a leaked PIN
+        # allows account takeover via /delegate/start. Read them from the
+        # station log on the box itself.
         "tunnel": {
             "quick_tunnel_enabled": cfg.CLOUDFLARE_TUNNEL_ENABLED,
             "permanent_url": cfg.CIPHER_PUBLIC_URL,
