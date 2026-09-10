@@ -199,7 +199,8 @@ def build_encrypted_post(file_bytes: bytes, metadata: dict,
     return blob, metadata_hex, self_envelope
 
 
-def build_metadata(file_path: Path, *, folder: str | None, filename: str | None) -> dict:
+def build_metadata(file_path: Path, *, folder: str | None, filename: str | None,
+                   client: str = CLIENT_NAME) -> dict:
     name = filename or file_path.name
     mime, _ = mimetypes.guess_type(name)
     return {
@@ -209,7 +210,7 @@ def build_metadata(file_path: Path, *, folder: str | None, filename: str | None)
         "extension": file_path.suffix.lstrip(".").lower(),
         "tags": [folder] if folder else [],
         "created_at": int(time.time()),
-        "client": CLIENT_NAME,
+        "client": client,
         "client_version": __version__,
     }
 
@@ -336,9 +337,10 @@ def cmd_post(args) -> None:
     if not file_path.is_file():
         sys.exit(f"No such file: {file_path}")
     file_bytes = file_path.read_bytes()
-    metadata = build_metadata(file_path, folder=args.folder, filename=args.filename)
+    metadata = build_metadata(file_path, folder=args.folder, filename=args.filename,
+                              client=args.client)
 
-    fields = {"client": CLIENT_NAME, "audience_mode": args.audience}
+    fields = {"client": args.client, "audience_mode": args.audience}
     if args.audience == "specific":
         if not args.audience_uids:
             sys.exit("--audience specific requires --audience-uids")
@@ -453,6 +455,8 @@ def main(argv=None) -> None:
                     choices=["self", "all", "specific", "public"])
     sp.add_argument("--audience-uids", help="comma-separated uids (audience=specific)")
     sp.add_argument("--filename", help="override stored filename")
+    sp.add_argument("--client", default=CLIENT_NAME,
+                    help="client bucket in the manifest (e.g. 'drive' to appear in drive apps; default: cli)")
     sp.set_defaults(func=cmd_post)
 
     sp = sub.add_parser("list", help="list posts with decrypted metadata")
