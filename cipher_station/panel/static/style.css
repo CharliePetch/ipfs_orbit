@@ -148,6 +148,24 @@ h2.page-title {
 .badge.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
 .badge.restart { color: var(--foreground); }
 
+/* Pending-request count on the Followers tab button */
+.tab-badge {
+  display: inline-block; min-width: 18px; padding: 0 6px;
+  border-radius: 999px; font-size: 0.72rem; line-height: 18px;
+  text-align: center; background: var(--accent); color: var(--background);
+  vertical-align: 1px;
+}
+
+/* ---- followers tab ---- */
+.follower-request {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.follower-request:last-child { border-bottom: none; }
+.follower-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.follower-info .mono { overflow-wrap: anywhere; }
+.follower-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
 /* ---- states ---- */
 .state-block { padding: var(--s-7) var(--s-4); text-align: center; color: var(--muted); }
 .state-block.danger { color: var(--danger); }

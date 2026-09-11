@@ -791,3 +791,235 @@ class TestNonAsciiFilenames:
         _, headers, _ = call_panel(
             panel_app, "GET", f"/admin/api/drive/file/{post_cid}", query=b"download=true")
         assert headers["content-disposition"] == 'attachment; filename="plain.pdf"'
+
+
+# ---------------------------------------------------------------------------
+# 7. Followers tab API: pending / approve / decline / revoke / badge count
+# ---------------------------------------------------------------------------
+
+def _follower_keys():
+    """Valid on-wire ML-KEM/ML-DSA public keys (hex) for a fake follower."""
+    from cipher_station import pqcrypto
+    ek, _ = pqcrypto.generate_mlkem_keypair()
+    pk, _ = pqcrypto.generate_mldsa_keypair()
+    return ek.hex(), pk.hex()
+
+
+def add_pending(uid, alias=None):
+    from cipher_station.followers import add_follower_device
+    mlkem_hex, mldsa_hex = _follower_keys()
+    add_follower_device(uid, device_uid=uid, mlkem_public_key=mlkem_hex,
+                        mldsa_public_key=mldsa_hex, alias=alias)
+    return mlkem_hex
+
+
+@pytest.fixture
+def followers_env(panel_env, monkeypatch, fake_ipfs):
+    """
+    Followers isolation on top of panel_env: graph.py and rewrap_envelopes.py
+    bind ipfs_add_bytes / ipfs_get_bytes at import time, so the fake_ipfs
+    fixture (which patches ipfs_client/manifest/posts/drive) does not reach
+    them — patch those bindings here so approve/revoke can run the REAL
+    rewrap + graph-rebuild path against the in-memory CID store.
+    """
+    import cipher_station.graph as graph_mod
+    import cipher_station.rewrap_envelopes as rw_mod
+
+    def fake_add(data: bytes) -> str:
+        cid = "Qm" + hashlib.sha256(data).hexdigest()[:44]
+        fake_ipfs[cid] = data
+        return cid
+
+    def fake_get(cid: str) -> bytes:
+        if cid not in fake_ipfs:
+            raise ipfs_mod.IPFSError(f"unknown CID {cid}")
+        return fake_ipfs[cid]
+
+    monkeypatch.setattr(graph_mod, "ipfs_add_bytes", fake_add)
+    monkeypatch.setattr(rw_mod, "ipfs_get_bytes", fake_get)
+    return fake_ipfs
+
+
+class TestFollowersAPI:
+    def test_pending_lists_request_then_approve_appears_in_followers(
+            self, panel_app, followers_env):
+        add_pending("alice-uid", alias="Alice")
+
+        status, obj = call_json(panel_app, "GET", "/admin/api/followers/pending")
+        assert status == 200
+        assert obj["count"] == 1
+        (p,) = obj["pending"]
+        assert p["uid"] == "alice-uid"
+        assert p["alias"] == "Alice"
+        assert p["allowed"] == "Pending"
+        assert p["mlkem_public_key"]
+
+        # Not a follower yet: pending entries hold no access.
+        status, obj = call_json(panel_app, "GET", "/admin/api/followers")
+        assert status == 200
+        assert obj["followers"] == []
+
+        status, obj = call_json(panel_app, "POST", "/admin/api/followers/approve",
+                                {"uid": "alice-uid"})
+        assert status == 200
+        assert obj["action"] == "approve_follower"
+        assert obj["devices_approved"] == 1
+        # Post-approve behavior mirrors main.py's /followers/approve exactly:
+        # envelope rewrap ran and the social graph was rebuilt.
+        assert obj["rewrap"] is not None
+        assert "error" not in (obj["rewrap"] or {})
+        assert obj["updated_graph"] is not None
+
+        status, obj = call_json(panel_app, "GET", "/admin/api/followers")
+        assert status == 200
+        (f,) = obj["followers"]
+        assert f["uid"] == "alice-uid"
+        assert f["alias"] == "Alice"
+        assert f["allowed"] == "Allowed"
+        assert f["devices"] == [{"device_uid": "alice-uid", "alias": "Alice"}]
+
+        status, obj = call_json(panel_app, "GET", "/admin/api/followers/pending")
+        assert obj["count"] == 0 and obj["pending"] == []
+
+    def test_decline_pending_removes_without_rewrap(self, panel_app, followers_env):
+        add_pending("bob-uid")
+
+        status, obj = call_json(panel_app, "POST", "/admin/api/followers/remove",
+                                {"uid": "bob-uid"})
+        assert status == 200
+        assert obj["removed"] == 1
+        assert obj["removed_allowed"] is False
+        # A pending request never held envelopes: no rewrap, no graph rebuild.
+        assert obj["rewrap"] is None
+        assert obj["updated_graph"] is None
+
+        _, obj = call_json(panel_app, "GET", "/admin/api/followers/pending")
+        assert obj["pending"] == []
+        from cipher_station.followers import list_follower_devices
+        assert list_follower_devices("bob-uid") == []
+
+    def test_revoke_approved_follower_rewraps_and_removes(self, panel_app, followers_env):
+        add_pending("carol-uid", alias="Carol")
+        status, _ = call_json(panel_app, "POST", "/admin/api/followers/approve",
+                              {"uid": "carol-uid"})
+        assert status == 200
+
+        status, obj = call_json(panel_app, "POST", "/admin/api/followers/remove",
+                                {"uid": "carol-uid"})
+        assert status == 200
+        assert obj["removed"] == 1
+        assert obj["removed_allowed"] is True
+        # Revoking an Allowed follower re-wraps and rebuilds — same as main.py.
+        assert obj["rewrap"] is not None
+        assert obj["updated_graph"] is not None
+
+        _, obj = call_json(panel_app, "GET", "/admin/api/followers")
+        assert obj["followers"] == []
+        from cipher_station.followers import list_follower_devices
+        assert list_follower_devices("carol-uid") == []
+
+    def test_auto_rewrap_flag_off_skips_rewrap_but_rebuilds_graph(
+            self, panel_app, followers_env, monkeypatch):
+        """CIPHER_AUTO_REWRAP_ON_FOLLOW_CHANGE=0 (inbox.AUTO_REWRAP_ON_FOLLOW_CHANGE)
+        must skip the envelope rewrap exactly like the inbound follow path."""
+        import cipher_station.inbox as inbox
+        monkeypatch.setattr(inbox, "AUTO_REWRAP_ON_FOLLOW_CHANGE", False)
+        add_pending("dave-uid")
+
+        status, obj = call_json(panel_app, "POST", "/admin/api/followers/approve",
+                                {"uid": "dave-uid"})
+        assert status == 200
+        assert obj["rewrap"] is None
+        assert obj.get("rewrap_skipped") is True
+        assert obj["updated_graph"] is not None  # graph still rebuilt
+
+    def test_badge_count_endpoint(self, panel_app, followers_env):
+        add_pending("p1")
+        add_pending("p2")
+        status, obj = call_json(panel_app, "GET", "/admin/api/followers/pending")
+        assert status == 200
+        assert obj["count"] == 2
+        assert len(obj["pending"]) == 2
+
+    def test_approve_unknown_is_404_and_self_uid_is_400(self, panel_app, followers_env):
+        status, _ = call_json(panel_app, "POST", "/admin/api/followers/approve",
+                              {"uid": "nobody"})
+        assert status == 404
+        status, _ = call_json(panel_app, "POST", "/admin/api/followers/remove",
+                              {"uid": "nobody"})
+        assert status == 404
+        self_uid = get_identity().uid
+        status, _ = call_json(panel_app, "POST", "/admin/api/followers/approve",
+                              {"uid": self_uid})
+        assert status == 400
+        status, _ = call_json(panel_app, "POST", "/admin/api/followers/remove",
+                              {"uid": self_uid})
+        assert status == 400
+
+    @pytest.mark.parametrize("method,path,body", [
+        ("GET", "/admin/api/followers", None),
+        ("GET", "/admin/api/followers/pending", None),
+        ("POST", "/admin/api/followers/approve", {"uid": "x"}),
+        ("POST", "/admin/api/followers/remove", {"uid": "x"}),
+    ])
+    def test_followers_routes_require_token(self, panel_app, method, path, body):
+        status, _ = call_json(panel_app, method, path, body, token=False)
+        assert status == 401
+
+    def test_followers_routes_are_localhost_only(self, panel_app):
+        status, _ = call_json(panel_app, "GET", "/admin/api/followers",
+                              client=REMOTE)
+        assert status == 403
+
+
+class TestFollowersRealTCP:
+    """The full lifecycle over a real socket, exactly as the browser drives it."""
+
+    def test_token_required_then_full_lifecycle(self, tcp_panel, followers_env):
+        base, token, _ = tcp_panel
+        auth = {"Authorization": f"Bearer {token}"}
+
+        # Token gate on the wire.
+        r = httpx.get(base + "/admin/api/followers/pending")
+        assert r.status_code == 401
+        r = httpx.get(base + "/admin/api/followers",
+                      headers={"Authorization": "Bearer wrong"})
+        assert r.status_code == 401
+
+        add_pending("eve-uid", alias="Eve")
+
+        # Badge count.
+        r = httpx.get(base + "/admin/api/followers/pending", headers=auth)
+        assert r.status_code == 200
+        assert r.json()["count"] == 1
+
+        # Approve → appears in followers.
+        r = httpx.post(base + "/admin/api/followers/approve", headers=auth,
+                       json={"uid": "eve-uid"})
+        assert r.status_code == 200
+        assert r.json()["devices_approved"] == 1
+
+        r = httpx.get(base + "/admin/api/followers", headers=auth)
+        followers = r.json()["followers"]
+        assert [f["uid"] for f in followers] == ["eve-uid"]
+        assert followers[0]["alias"] == "Eve"
+
+        # Revoke → removed.
+        r = httpx.post(base + "/admin/api/followers/remove", headers=auth,
+                       json={"uid": "eve-uid"})
+        assert r.status_code == 200
+        assert r.json()["removed_allowed"] is True
+        r = httpx.get(base + "/admin/api/followers", headers=auth)
+        assert r.json()["followers"] == []
+
+    def test_decline_over_tcp_removes_pending(self, tcp_panel, followers_env):
+        base, token, _ = tcp_panel
+        auth = {"Authorization": f"Bearer {token}"}
+        add_pending("mallory-uid")
+
+        r = httpx.post(base + "/admin/api/followers/remove", headers=auth,
+                       json={"uid": "mallory-uid"})
+        assert r.status_code == 200
+        assert r.json()["removed_allowed"] is False
+        r = httpx.get(base + "/admin/api/followers/pending", headers=auth)
+        assert r.json() == {"status": "ok", "pending": [], "count": 0}

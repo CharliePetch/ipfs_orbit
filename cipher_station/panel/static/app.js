@@ -121,6 +121,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
     $("tab-" + btn.dataset.tab).classList.remove("hidden");
     if (btn.dataset.tab === "drive") loadDrive();
+    if (btn.dataset.tab === "followers") loadFollowers();
     if (btn.dataset.tab === "config") loadConfig();
     if (btn.dataset.tab === "registry") loadRegistry();
   });
@@ -535,6 +536,170 @@ $("rg-reserved-save").addEventListener("click", async () => {
     loadRegistry();
   } catch (err) { setMsg("rg-reserved-msg", err.message, true); }
 });
+
+/* ---------------- followers ---------------- */
+
+async function refreshFollowerBadge() {
+  try {
+    const p = await api("/admin/api/followers/pending");
+    const badge = $("fl-badge");
+    const n = p.count || 0;
+    badge.textContent = n;
+    badge.classList.toggle("hidden", n === 0);
+  } catch (_) { /* not logged in yet / transient — badge stays as-is */ }
+}
+
+async function loadFollowers() {
+  $("fl-error").classList.add("hidden");
+  try {
+    const [pending, followers] = await Promise.all([
+      api("/admin/api/followers/pending"),
+      api("/admin/api/followers"),
+    ]);
+    $("fl-loading").classList.add("hidden");
+    $("fl-body").classList.remove("hidden");
+    renderPendingFollowers(pending.pending || []);
+    renderFollowers(followers.followers || []);
+    const badge = $("fl-badge");
+    const n = pending.count || 0;
+    badge.textContent = n;
+    badge.classList.toggle("hidden", n === 0);
+  } catch (err) {
+    $("fl-loading").classList.add("hidden");
+    $("fl-body").classList.add("hidden");
+    const el = $("fl-error");
+    el.textContent = "Could not load followers: " + err.message;
+    el.classList.remove("hidden");
+  }
+}
+
+function renderPendingFollowers(pending) {
+  const list = $("fl-pending-list");
+  const empty = $("fl-pending-empty");
+  const badge = $("fl-pending-badge");
+  list.innerHTML = "";
+  empty.classList.toggle("hidden", pending.length > 0);
+  badge.textContent = pending.length;
+  badge.classList.toggle("hidden", pending.length === 0);
+
+  pending.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "follower-request";
+
+    const info = document.createElement("div");
+    info.className = "follower-info";
+    const name = document.createElement("div");
+    name.innerHTML = p.alias
+      ? `<strong>${escapeHtml(p.alias)}</strong>`
+      : '<span class="hint" style="margin:0">(no alias)</span>';
+    const uid = document.createElement("div");
+    uid.className = "mono copyable";
+    uid.title = "Click to copy";
+    uid.textContent = p.uid;
+    const keys = document.createElement("div");
+    keys.className = "hint";
+    keys.style.margin = "0";
+    const parts = [];
+    if (p.mlkem_public_key) parts.push("ML-KEM content key");
+    if (p.mldsa_public_key) parts.push("ML-DSA auth key");
+    keys.textContent = "Requested keys: " + (parts.join(" + ") || "none") +
+      (p.device_uid && p.device_uid !== p.uid ? ` · device ${p.device_uid}` : "");
+    info.append(name, uid, keys);
+
+    const actions = document.createElement("div");
+    actions.className = "follower-actions";
+    const allow = document.createElement("button");
+    allow.className = "btn primary small";
+    allow.textContent = "Allow";
+    allow.addEventListener("click", async () => {
+      allow.disabled = true;
+      try {
+        await postJson("/admin/api/followers/approve",
+                       { uid: p.uid, device_uid: p.device_uid });
+        toast(`Approved ${p.alias || p.uid}`);
+        loadFollowers();
+      } catch (err) {
+        allow.disabled = false;
+        toast("Approve failed: " + err.message, true);
+      }
+    });
+    const decline = document.createElement("button");
+    decline.className = "btn small";
+    decline.textContent = "Decline";
+    decline.addEventListener("click", async () => {
+      decline.disabled = true;
+      try {
+        await postJson("/admin/api/followers/remove",
+                       { uid: p.uid, device_uid: p.device_uid });
+        toast(`Declined ${p.alias || p.uid}`);
+        loadFollowers();
+      } catch (err) {
+        decline.disabled = false;
+        toast("Decline failed: " + err.message, true);
+      }
+    });
+    actions.append(allow, decline);
+
+    row.append(info, actions);
+    list.appendChild(row);
+  });
+}
+
+function renderFollowers(followers) {
+  $("fl-followers-empty").classList.toggle("hidden", followers.length > 0);
+  $("fl-followers-table").classList.toggle("hidden", followers.length === 0);
+  const tbody = $("fl-followers-rows");
+  tbody.innerHTML = "";
+  followers.forEach((f) => {
+    const tr = document.createElement("tr");
+
+    const alias = document.createElement("td");
+    alias.textContent = f.alias || "—";
+    const uid = document.createElement("td");
+    uid.className = "mono copyable";
+    uid.title = "Click to copy";
+    uid.textContent = f.uid;
+    const devices = document.createElement("td");
+    const devs = f.devices || [];
+    devices.textContent = devs.length === 1 && devs[0].device_uid === f.uid
+      ? "1 device"
+      : `${devs.length} device${devs.length === 1 ? "" : "s"}`;
+    devices.title = devs.map((d) => d.device_uid).join("\n");
+    const status = document.createElement("td");
+    status.innerHTML = '<span class="dot"></span>Allowed';
+
+    const act = document.createElement("td");
+    const revoke = document.createElement("button");
+    revoke.className = "btn small danger-btn";
+    revoke.textContent = "Revoke";
+    revoke.addEventListener("click", async () => {
+      if (!confirm(`Revoke ${f.alias || f.uid}? They stop receiving new content ` +
+                   "envelopes; content is re-wrapped without them.")) return;
+      revoke.disabled = true;
+      try {
+        await postJson("/admin/api/followers/remove", { uid: f.uid });
+        toast(`Revoked ${f.alias || f.uid}`);
+        loadFollowers();
+      } catch (err) {
+        revoke.disabled = false;
+        toast("Revoke failed: " + err.message, true);
+      }
+    });
+    act.appendChild(revoke);
+
+    tr.append(alias, uid, devices, status, act);
+    tbody.appendChild(tr);
+  });
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+refreshFollowerBadge();
+setInterval(refreshFollowerBadge, 15000);
 
 /* ---------------- drive ---------------- */
 let driveState = { files: [], folders: [], filter: null, loaded: false };

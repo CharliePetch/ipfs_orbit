@@ -33,6 +33,7 @@
   <nav class="tabs" role="tablist">
     <button class="tab active" data-tab="dashboard">Dashboard</button>
     <button class="tab" data-tab="drive">Drive</button>
+    <button class="tab" data-tab="followers">Followers <span id="fl-badge" class="tab-badge hidden"></span></button>
     <button class="tab" data-tab="config">Configuration</button>
     <button class="tab hidden" data-tab="registry" id="registry-tab-btn">Registry</button>
   </nav>
@@ -249,6 +250,28 @@
   </div>
 
   <div id="dr-uploads" class="uploads hidden"></div>
+</section>
+
+<!-- ======================= FOLLOWERS ======================= -->
+<section id="tab-followers" class="tab-panel hidden">
+  <div id="fl-loading" class="state-block">Loading followers…</div>
+  <div id="fl-error" class="state-block danger hidden"></div>
+  <div id="fl-body" class="hidden">
+    <div class="card">
+      <div class="label">Pending requests <span id="fl-pending-badge" class="badge accent hidden"></span></div>
+      <div id="fl-pending-empty" class="hint hidden">No pending follow requests.</div>
+      <div id="fl-pending-list"></div>
+    </div>
+    <div class="card">
+      <div class="label">Followers</div>
+      <div id="fl-followers-empty" class="hint hidden">No followers yet.
+        When someone follows this station and you approve them, they appear here.</div>
+      <table class="claims-table hidden" id="fl-followers-table">
+        <thead><tr><th>Alias</th><th>UID</th><th>Devices</th><th>Status</th><th></th></tr></thead>
+        <tbody id="fl-followers-rows"></tbody>
+      </table>
+    </div>
+  </div>
 </section>
 
 <!-- ======================= REGISTRY ======================= -->
