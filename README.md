@@ -112,6 +112,10 @@ Settings are read from the environment or a `.env` file in the project root (the
 | `CIPHER_FETCH_MAX_CONCURRENT` | `4` | In-flight fetches before the station answers 503 |
 | `CIPHER_FETCH_PIN` | `false` | Pin fetched content instead of leaving it as GC-able cache |
 | `CIPHER_BACKUP_DEST` | _(auto-detect USB)_ | Fixed destination for the daily backup |
+| `CIPHER_PUBLIC_URL_MODE` | `quick` | Public URL mode: `quick` / `domain` / `grant` — see [Public URL modes](#public-url-modes) |
+| `VERCEL_API_TOKEN` | _(unset)_ | Vercel DNS driver credential (own-domain mode / registry zones) |
+| `CLOUDFLARE_API_TOKEN` | _(unset)_ | Cloudflare DNS driver credential (own-domain mode / registry zones) |
+| `REGISTRY_ENABLED` | `false` | Serve the subdomain registry API on :8443 — see [Subdomain registry](#subdomain-registry) |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
 See [PROTOCOL.md](PROTOCOL.md) Appendix B for the full configuration reference.
@@ -363,6 +367,79 @@ From another machine, use an SSH tunnel:
 ssh -L 8444:localhost:8444 user@station
 # then open http://localhost:8444/admin locally
 ```
+
+## Public URL modes
+
+The panel's Configuration tab offers three ways to give the station a public
+URL (radio selection under **Public URL**). All modes are keys-optional:
+missing or invalid credentials degrade to the quick tunnel with a banner —
+never an unreachable station.
+
+1. **Quick tunnel** (default) — the existing Cloudflare quick tunnel. Zero
+   setup, ephemeral `https://<words>.trycloudflare.com` URL that rotates every
+   restart.
+2. **Own domain** — a permanent hostname on a domain you control. The panel
+   keeps DNS **A/AAAA records pointed at the station's current public IPs**
+   (discovered via ipify/icanhazip; v4-only and v6-only networks both work)
+   and re-checks every 5 minutes (DDNS). Two DNS drivers behind one
+   `DnsProvider` interface:
+   - **Vercel** — set `VERCEL_API_TOKEN` in `.env`.
+   - **Cloudflare** — set `CLOUDFLARE_API_TOKEN` in `.env` (zone must be
+     CF-hosted; named-tunnel provisioning is not part of this mode — records
+     only).
+
+   This mode requires a **router port-forward** (WAN TCP 8443 or 443 → the
+   station's LAN IP:8443); the panel shows the exact LAN IP and port. TLS
+   note: the station serves its own (self-signed) certificate on :8443; a
+   trusted-certificate (ACME) flow is future work. `CIPHER_PUBLIC_URL` is set
+   from the chosen hostname while the mode is active.
+3. **Subdomain grant** — claim a name (e.g. `charlie.cipherstation.io`) from
+   a remote **subdomain registry** run by another operator (see below). The
+   claim, heartbeats, and release are signed with this station's ML-DSA
+   identity key; the panel shows availability/claim status and keeps the
+   registry pointed at the station's current target.
+
+## Subdomain registry
+
+Any station can also *run* a registry that hands out subdomains on DNS zones
+its operator controls. It ships in the repo and is **off by default** — set
+`REGISTRY_ENABLED=true` in `.env` to mount the public API on :8443
+(`/registry/*`). Zone configuration lives in `<data_dir>/registry.json`:
+
+```json
+{
+  "zones": {
+    "cipherstation.io": {
+      "driver": "cloudflare",
+      "token_env": "CLOUDFLARE_API_TOKEN",
+      "claim_mode": "public",
+      "reserved": ["extra-blocked-name"]
+    }
+  }
+}
+```
+
+- **Claim modes:** `own` (admin-only via the panel), `invite` (claims need an
+  admin-issued invite code), `public` (open claims).
+- **Reserved names:** a built-in list (`www`, `mail`, `api`, `admin`,
+  `panel`, `station`, `ns*`, plus an impersonation list — `login`, `secure`,
+  `support`, `official`, `bank`, …) is always enforced; per-zone extras can
+  be edited in the panel's Registry tab.
+- **API** (rate-limited per client IP; all mutations ML-DSA-signed over a
+  canonical payload with timestamp + nonce replay protection):
+  - `GET /registry/check?name=x&zone=y` → `{available, reason?}`
+  - `POST /registry/claim` → 201 (creates the DNS record + claim row),
+    409 if taken (`taken_since`), 403 reserved/denied, 400 invalid. Names are
+    single DNS labels: 1–63 chars of `[a-z0-9-]`, no edge hyphens.
+  - `POST /registry/heartbeat` — refreshes the claim; accepts an updated
+    target (re-upserts DNS on change).
+  - `POST /registry/release` — owner-signed release (deletes DNS + row).
+- **Expiry:** claims lapse **90 days** after the last heartbeat; expired
+  names revert to available and their DNS records are deleted (lazily, on
+  the next check/claim of the name).
+- **Administration:** the panel gains a **Registry** tab (only when
+  `REGISTRY_ENABLED=true`) with a claims table (revoke), invite-code
+  issuance, per-zone driver/token status, and the reserved-name editor.
 
 ## Managing Your Station
 

@@ -142,6 +142,11 @@ def set_storage_max(value: str) -> None:
 # Station config (.env-backed settings + station name)
 # ---------------------------------------------------------------------------
 
+def _registry_enabled() -> bool:
+    from cipher_station.registry.config import REGISTRY_ENABLED
+    return REGISTRY_ENABLED
+
+
 def get_config() -> dict:
     from cipher_station.profile import PROFILE_CLIENT
     from cipher_station.manifest import get_client_profile
@@ -153,6 +158,7 @@ def get_config() -> dict:
         "cloudflare_tunnel_enabled": cfg.CLOUDFLARE_TUNNEL_ENABLED,
         "permanent_url": cfg.CIPHER_PUBLIC_URL,
         "ipfs_storage_max": get_storage_max(),
+        "registry_enabled": _registry_enabled(),
         "restart_command": "sudo systemctl restart cipherstation",
         "ipfs_restart_command": "sudo systemctl restart ipfs",
     }

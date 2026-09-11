@@ -257,3 +257,179 @@ def api_drive_delete(req: DriveDelete):
     except Exception as e:
         logger.error("Drive delete failed for %s: %s", req.post_cid, e)
         raise HTTPException(status_code=503, detail=f"delete failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Followers API (pending requests + current followers)
+# ---------------------------------------------------------------------------
+
+class FollowerAction(BaseModel):
+    uid: str
+    device_uid: str | None = None  # omit to act on every device for this uid
+
+
+def _followers_admin():
+    from cipher_station.panel import followers_admin
+    return followers_admin
+
+
+@panel_api.get("/followers")
+def api_followers():
+    return _followers_admin().get_followers()
+
+
+@panel_api.get("/followers/pending")
+def api_followers_pending():
+    return _followers_admin().get_pending()
+
+
+@panel_api.post("/followers/approve")
+def api_followers_approve(req: FollowerAction):
+    fa = _followers_admin()
+    try:
+        return fa.approve(req.uid, req.device_uid)
+    except fa.SelfUidError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except fa.NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e.args[0]))
+
+
+@panel_api.post("/followers/remove")
+def api_followers_remove(req: FollowerAction):
+    fa = _followers_admin()
+    try:
+        return fa.remove(req.uid, req.device_uid)
+    except fa.SelfUidError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except fa.NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e.args[0]))
+
+
+# ---------------------------------------------------------------------------
+# Public URL modes (quick tunnel / own domain / subdomain grant)
+# ---------------------------------------------------------------------------
+
+@panel_api.get("/public-url")
+def api_get_public_url():
+    from cipher_station.panel import public_url
+    return public_url.get_public_url_config()
+
+
+class PublicUrlUpdate(BaseModel):
+    mode: str
+    hostname: str | None = None
+    zone: str | None = None
+    driver: str | None = None
+    registry_url: str | None = None
+    grant_name: str | None = None
+    grant_zone: str | None = None
+
+
+@panel_api.post("/public-url")
+def api_set_public_url(req: PublicUrlUpdate):
+    from cipher_station.panel import public_url
+    try:
+        return public_url.set_public_url_mode(
+            mode=req.mode, hostname=req.hostname, zone=req.zone,
+            driver=req.driver, registry_url=req.registry_url,
+            grant_name=req.grant_name, grant_zone=req.grant_zone,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class GrantAction(BaseModel):
+    name: str
+    zone: str
+    target: str | None = None
+    record_type: str | None = None
+    invite_code: str | None = None
+
+
+def _grant_call(fn, *args, **kwargs):
+    from cipher_station.registry.client import RegistryClientError
+    try:
+        return fn(*args, **kwargs)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RegistryClientError as e:
+        status = e.status if e.status and 400 <= e.status < 500 else 502
+        raise HTTPException(status_code=status, detail=str(e.detail))
+
+
+@panel_api.post("/public-url/grant/check")
+def api_grant_check(req: GrantAction):
+    from cipher_station.panel import public_url
+    return _grant_call(public_url.grant_check, req.name, req.zone)
+
+
+@panel_api.post("/public-url/grant/claim")
+def api_grant_claim(req: GrantAction):
+    from cipher_station.panel import public_url
+    if not req.target or not req.record_type:
+        raise HTTPException(status_code=400, detail="target and record_type required")
+    return _grant_call(public_url.grant_claim, req.name, req.zone,
+                       req.target, req.record_type, req.invite_code)
+
+
+@panel_api.post("/public-url/grant/release")
+def api_grant_release(req: GrantAction):
+    from cipher_station.panel import public_url
+    return _grant_call(public_url.grant_release, req.name, req.zone)
+
+
+# ---------------------------------------------------------------------------
+# Subdomain registry administration (only meaningful when this station RUNS
+# a registry: REGISTRY_ENABLED=true). Localhost + panel token like everything
+# else here; the signed public API lives on the :8443 app.
+# ---------------------------------------------------------------------------
+
+def _registry_service():
+    from cipher_station.registry import service as registry_service
+    return registry_service
+
+
+@panel_api.get("/registry")
+def api_registry_overview():
+    return _registry_service().admin_overview()
+
+
+class RegistryRevoke(BaseModel):
+    name: str
+    zone: str
+
+
+@panel_api.post("/registry/revoke")
+def api_registry_revoke(req: RegistryRevoke):
+    svc = _registry_service()
+    try:
+        return svc.admin_revoke(req.name, req.zone)
+    except svc.RegistryError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
+
+
+class RegistryInvite(BaseModel):
+    zone: str
+
+
+@panel_api.post("/registry/invite")
+def api_registry_invite(req: RegistryInvite):
+    from cipher_station.registry import config as rcfg, store
+    if req.zone not in rcfg.load_zones():
+        raise HTTPException(status_code=400, detail=f"unknown zone: {req.zone!r}")
+    return {"code": store.create_invite(req.zone), "zone": req.zone}
+
+
+class RegistryReserved(BaseModel):
+    zone: str
+    reserved: list[str]
+
+
+@panel_api.post("/registry/reserved")
+def api_registry_reserved(req: RegistryReserved):
+    svc = _registry_service()
+    try:
+        return {"zone": req.zone,
+                "reserved_extra": svc.admin_set_reserved(req.zone, req.reserved)}
+    except svc.RegistryError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)

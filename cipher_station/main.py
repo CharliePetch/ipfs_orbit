@@ -69,6 +69,16 @@ app = FastAPI(title="Cipher Station Node", version="1.0.0")
 # 127.0.0.1-only listener (cipher_station/panel/app.py, default port 8444) so
 # that cloudflared / reverse proxies targeting this app can never reach it.
 
+# Subdomain registry: PUBLIC API, mounted here (the :8443 app) only when the
+# operator opts in with REGISTRY_ENABLED=true — it is meant to be reachable
+# by other stations. Signed claims + per-IP rate limiting; see
+# cipher_station/registry/router.py for the security model.
+from cipher_station.registry.config import REGISTRY_ENABLED as _REGISTRY_ENABLED
+if _REGISTRY_ENABLED:
+    from cipher_station.registry.router import registry_router
+    app.include_router(registry_router)
+    logger.info("Subdomain registry API enabled at /registry/*")
+
 # --------------------------------------------
 # CORS
 # --------------------------------------------
