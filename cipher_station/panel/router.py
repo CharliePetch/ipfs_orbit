@@ -260,6 +260,52 @@ def api_drive_delete(req: DriveDelete):
 
 
 # ---------------------------------------------------------------------------
+# Followers API (pending requests + current followers)
+# ---------------------------------------------------------------------------
+
+class FollowerAction(BaseModel):
+    uid: str
+    device_uid: str | None = None  # omit to act on every device for this uid
+
+
+def _followers_admin():
+    from cipher_station.panel import followers_admin
+    return followers_admin
+
+
+@panel_api.get("/followers")
+def api_followers():
+    return _followers_admin().get_followers()
+
+
+@panel_api.get("/followers/pending")
+def api_followers_pending():
+    return _followers_admin().get_pending()
+
+
+@panel_api.post("/followers/approve")
+def api_followers_approve(req: FollowerAction):
+    fa = _followers_admin()
+    try:
+        return fa.approve(req.uid, req.device_uid)
+    except fa.SelfUidError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except fa.NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e.args[0]))
+
+
+@panel_api.post("/followers/remove")
+def api_followers_remove(req: FollowerAction):
+    fa = _followers_admin()
+    try:
+        return fa.remove(req.uid, req.device_uid)
+    except fa.SelfUidError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except fa.NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e.args[0]))
+
+
+# ---------------------------------------------------------------------------
 # Public URL modes (quick tunnel / own domain / subdomain grant)
 # ---------------------------------------------------------------------------
 
